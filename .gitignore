@@ -1,0 +1,11 @@
+build/
+cmake-build-*/
+compile_commands.json
+.cache/
+*.rdb
+*.aof
+*.o
+*.a
+.DS_Store
+.vscode/
+.idea/

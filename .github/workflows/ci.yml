@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      # The interop suite is the real proof: it drives our server with the
+      # genuine redis-cli and asserts byte-level protocol compatibility.
+      - name: Install real Redis (for interop)
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y redis-tools redis-server
+          else
+            brew install redis
+          fi
+
+      - name: Interop tests against real redis-cli
+        run: ./scripts/interop_test.sh
+
+  sanitizers:
+    name: asan+ubsan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure with sanitizers
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DMNEMOS_SANITIZE=ON
+      - name: Build
+        run: cmake --build build -j
+      - name: Unit tests under sanitizers
+        run: ctest --test-dir build --output-on-failure
