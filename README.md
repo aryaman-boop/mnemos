@@ -145,8 +145,11 @@ both, and compares every reply. Unit tests can only show that mnemos agrees
 with itself; this shows it agrees with the thing it's imitating, including on
 edge cases nobody thinks to write a test for — negative `LREM` counts,
 `ZADD GT/LT`, exclusive score ranges, `WRONGTYPE` on every command, and the
-rule that a collection is deleted once its last element is removed. All 23
-suites currently match byte for byte against Redis 8.10.1.
+rule that a collection is deleted once its last element is removed. Pub/sub is
+covered the same way, over two connections per server, so a delivered message
+has to arrive on the right one with the right framing. All 29 suites match byte
+for byte against Redis 8.10.1; a suite that depends on behaviour newer than the
+reference server is skipped and counted, never quietly passed.
 
 The interop suite adds 51 assertions driven through the genuine `redis-cli`.
 Unit tests cover protocol parsing under byte-by-byte fragmentation, `SCAN`
@@ -167,7 +170,7 @@ src/persist/   RDB and AOF                          (in progress)
 src/repl/      replication                          (in progress)
 src/mcp/       MCP server                           (in progress)
 tests/         unit tests
-scripts/       interoperability suite
+scripts/       check.sh, interop and differential suites
 ```
 
 ## License

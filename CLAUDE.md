@@ -35,6 +35,20 @@ new differential suite in `scripts/differential_test.py` (`SUITES`), not just a
 unit test. Error strings must be byte-identical to Redis's — use the helpers in
 `namespace replies` (`command_table.h`), never a hand-written string.
 
+A suite is `(name, commands, flags)`. The flags that exist:
+
+- `two_clients` — each step is `(index, *command)` and runs on connection 0 or
+  1. Needed for anything one connection observes another doing.
+- `min_redis: (7, 2)` — skip below that reference version. For behaviour newer
+  than the redis a CI image ships, *not* for papering over a real difference.
+  Skips are printed and counted in the verdict.
+- `unordered` — compare replies as multisets, for genuinely unordered ones.
+
+Two pseudo-commands: `@recv` reads a frame nobody asked for (a delivered
+message; it blocks on the socket timeout, so one that never arrives fails), and
+`@hello3` switches that connection to RESP3. One step must consume exactly one
+frame — `UNSUBSCRIBE a b` sends two and desyncs the connection.
+
 ## Layout
 
 ```
@@ -59,6 +73,11 @@ already wired in the glob and will build as soon as they contain sources.
    (negative = "at least |n|", Redis's convention), flags, first/last key, step.
 4. A differential suite covering it, including its WRONGTYPE and arity errors.
 
+Commands whose first argument selects a subcommand need the `kContainer` flag:
+Redis names them `parent|sub` when it quotes them back, and their two error
+shapes come from `replies::unknownSubcommand` and
+`replies::subcommandSyntaxError`.
+
 Collection commands must go through `type_helpers.h` — `lookupTyped`,
 `lookupOrCreate`, `deleteIfEmpty`. Those encode three rules that are easy to get
 wrong: WRONGTYPE stops the command; a write to a missing key creates the
@@ -72,6 +91,9 @@ collection; a collection that becomes empty is *deleted* (`EXISTS` → 0).
   thresholds match Redis's exactly — do not approximate them.
 - Single-threaded by design: every command is atomic without locking. Do not
   introduce threads or locks into the command path.
+- Anything written to a client other than the one running the command is built
+  against *that* client's protocol version (`Server::queueWrite`, and pub/sub
+  delivery for the worked example). RESP2 and RESP3 frame pushes differently.
 
 ## Not yet implemented
 
