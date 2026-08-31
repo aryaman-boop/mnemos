@@ -2,73 +2,38 @@
 
 #include <limits>
 
+#include "core/encoding.h"
+
 namespace mnemos::core {
 
-std::string_view typeName(ObjType t) {
-    switch (t) {
-        case ObjType::String: return "string";
-        case ObjType::List:   return "list";
-        case ObjType::Set:    return "set";
-        case ObjType::Hash:   return "hash";
-        case ObjType::ZSet:   return "zset";
-    }
-    return "unknown";
+Value::Value(const Value& other)
+    : type_(other.type_), encoding_(other.encoding_), last_access_ms_(other.last_access_ms_) {
+    // Deep copy: two keys must never share a collection, or RENAME/COPY would
+    // alias them and a write to one would be visible through the other.
+    std::visit(
+        [this](const auto& arm) {
+            using T = std::decay_t<decltype(arm)>;
+            if constexpr (std::is_same_v<T, std::unique_ptr<ListValue>>) {
+                data_ = arm ? std::make_unique<ListValue>(*arm) : nullptr;
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<HashValue>>) {
+                data_ = arm ? std::make_unique<HashValue>(*arm) : nullptr;
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<SetValue>>) {
+                data_ = arm ? std::make_unique<SetValue>(*arm) : nullptr;
+            } else if constexpr (std::is_same_v<T, std::unique_ptr<ZSetValue>>) {
+                data_ = arm ? std::make_unique<ZSetValue>(*arm) : nullptr;
+            } else {
+                data_ = arm;
+            }
+        },
+        other.data_);
 }
 
-std::string_view encodingName(ObjEncoding e) {
-    switch (e) {
-        case ObjEncoding::Int:       return "int";
-        case ObjEncoding::EmbStr:    return "embstr";
-        case ObjEncoding::Raw:       return "raw";
-        case ObjEncoding::ListPack:  return "listpack";
-        case ObjEncoding::QuickList: return "quicklist";
-        case ObjEncoding::IntSet:    return "intset";
-        case ObjEncoding::HashTable: return "hashtable";
-        case ObjEncoding::SkipList:  return "skiplist";
-    }
-    return "unknown";
+Value& Value::operator=(const Value& other) {
+    if (this != &other) *this = Value(other);  // copy-construct, then move-assign
+    return *this;
 }
 
-bool stringToInt64(std::string_view s, std::int64_t& out) {
-    if (s.empty() || s.size() >= 21) return false;
-
-    std::size_t i = 0;
-    bool negative = false;
-    if (s[0] == '-') {
-        negative = true;
-        i = 1;
-        if (s.size() == 1) return false;
-    }
-
-    // "0" is the only representation that may start with a zero digit; this is
-    // what keeps "007" and "-0" out of the int encoding.
-    if (s[i] == '0') {
-        if (s.size() - i != 1) return false;
-        if (negative) return false;
-        out = 0;
-        return true;
-    }
-
-    std::uint64_t acc = 0;
-    for (; i < s.size(); ++i) {
-        const char c = s[i];
-        if (c < '0' || c > '9') return false;
-        const auto digit = static_cast<std::uint64_t>(c - '0');
-        if (acc > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) return false;
-        acc = acc * 10 + digit;
-    }
-
-    constexpr auto kMax = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
-    if (negative) {
-        if (acc > kMax + 1) return false;
-        out = (acc == kMax + 1) ? std::numeric_limits<std::int64_t>::min()
-                                : -static_cast<std::int64_t>(acc);
-    } else {
-        if (acc > kMax) return false;
-        out = static_cast<std::int64_t>(acc);
-    }
-    return true;
-}
+// --- construction -----------------------------------------------------------
 
 Value Value::makeString(std::string_view s) {
     Value v;
@@ -102,24 +67,84 @@ Value Value::makeInt(std::int64_t n) {
     return v;
 }
 
+Value Value::makeList() {
+    Value v;
+    v.type_ = ObjType::List;
+    v.data_ = std::make_unique<ListValue>();
+    return v;
+}
+
+Value Value::makeHash() {
+    Value v;
+    v.type_ = ObjType::Hash;
+    v.data_ = std::make_unique<HashValue>();
+    return v;
+}
+
+Value Value::makeSet() {
+    Value v;
+    v.type_ = ObjType::Set;
+    v.data_ = std::make_unique<SetValue>();
+    return v;
+}
+
+Value Value::makeZSet() {
+    Value v;
+    v.type_ = ObjType::ZSet;
+    v.data_ = std::make_unique<ZSetValue>();
+    return v;
+}
+
+// --- identity ---------------------------------------------------------------
+
+ObjEncoding Value::encoding() const {
+    // Collections own their own encoding state, so it is read from them rather
+    // than cached here -- a stale copy would make OBJECT ENCODING lie.
+    switch (type_) {
+        case ObjType::String: return encoding_;
+        case ObjType::List:   return list() ? list()->encoding() : ObjEncoding::ListPack;
+        case ObjType::Hash:   return hash() ? hash()->encoding() : ObjEncoding::ListPack;
+        case ObjType::Set:    return set()  ? set()->encoding()  : ObjEncoding::IntSet;
+        case ObjType::ZSet:   return zset() ? zset()->encoding() : ObjEncoding::ListPack;
+    }
+    return encoding_;
+}
+
+std::size_t Value::elementCount() const {
+    switch (type_) {
+        case ObjType::String: return 1;
+        case ObjType::List:   return list() ? list()->size() : 0;
+        case ObjType::Hash:   return hash() ? hash()->size() : 0;
+        case ObjType::Set:    return set()  ? set()->size()  : 0;
+        case ObjType::ZSet:   return zset() ? zset()->size() : 0;
+    }
+    return 0;
+}
+
+// --- string access ----------------------------------------------------------
+
 std::string Value::stringValue() const {
-    if (encoding_ == ObjEncoding::Int) {
+    if (encoding_ == ObjEncoding::Int && std::holds_alternative<std::int64_t>(data_)) {
         return std::to_string(std::get<std::int64_t>(data_));
     }
-    return std::get<std::string>(data_);
+    if (const std::string* s = std::get_if<std::string>(&data_)) return *s;
+    return {};
 }
 
 std::string_view Value::stringRef() const {
-    if (encoding_ == ObjEncoding::Int) return {};
-    return std::get<std::string>(data_);
+    if (const std::string* s = std::get_if<std::string>(&data_)) return *s;
+    return {};
 }
 
 bool Value::asInt(std::int64_t& out) const {
-    if (encoding_ == ObjEncoding::Int) {
-        out = std::get<std::int64_t>(data_);
+    if (const std::int64_t* n = std::get_if<std::int64_t>(&data_)) {
+        out = *n;
         return true;
     }
-    return stringToInt64(std::get<std::string>(data_), out);
+    if (const std::string* s = std::get_if<std::string>(&data_)) {
+        return stringToInt64(*s, out);
+    }
+    return false;
 }
 
 void Value::makeMutable() {
@@ -140,24 +165,88 @@ std::string& Value::mutableString() {
 }
 
 std::size_t Value::stringLength() const {
-    if (encoding_ == ObjEncoding::Int) {
+    if (const std::int64_t* n = std::get_if<std::int64_t>(&data_)) {
         // Cheaper than materialising: count the decimal digits directly.
-        std::int64_t n = std::get<std::int64_t>(data_);
-        std::size_t len = (n < 0) ? 1 : 0;
-        std::uint64_t magnitude = (n < 0) ? -static_cast<std::uint64_t>(n)
-                                          :  static_cast<std::uint64_t>(n);
-        do { ++len; magnitude /= 10; } while (magnitude > 0);
+        std::size_t len = (*n < 0) ? 1 : 0;
+        std::uint64_t magnitude =
+            (*n < 0) ? -static_cast<std::uint64_t>(*n) : static_cast<std::uint64_t>(*n);
+        do {
+            ++len;
+            magnitude /= 10;
+        } while (magnitude > 0);
         return len;
     }
-    return std::get<std::string>(data_).size();
+    if (const std::string* s = std::get_if<std::string>(&data_)) return s->size();
+    return 0;
 }
+
+// --- collection access ------------------------------------------------------
+
+namespace {
+template <typename T>
+T* arm(std::variant<std::int64_t, std::string, std::unique_ptr<ListValue>,
+                    std::unique_ptr<HashValue>, std::unique_ptr<SetValue>,
+                    std::unique_ptr<ZSetValue>>& data) {
+    auto* held = std::get_if<std::unique_ptr<T>>(&data);
+    return held ? held->get() : nullptr;
+}
+}  // namespace
+
+ListValue* Value::list() { return arm<ListValue>(data_); }
+HashValue* Value::hash() { return arm<HashValue>(data_); }
+SetValue*  Value::set()  { return arm<SetValue>(data_); }
+ZSetValue* Value::zset() { return arm<ZSetValue>(data_); }
+
+const ListValue* Value::list() const { return const_cast<Value*>(this)->list(); }
+const HashValue* Value::hash() const { return const_cast<Value*>(this)->hash(); }
+const SetValue*  Value::set()  const { return const_cast<Value*>(this)->set(); }
+const ZSetValue* Value::zset() const { return const_cast<Value*>(this)->zset(); }
+
+// --- bookkeeping ------------------------------------------------------------
 
 std::size_t Value::memoryUsage() const {
     constexpr std::size_t kObjectHeader = 16;
-    if (encoding_ == ObjEncoding::Int) return kObjectHeader;
-    const std::string& s = std::get<std::string>(data_);
-    // embstr shares one allocation with the header; raw pays for a second.
-    return kObjectHeader + s.capacity() + (encoding_ == ObjEncoding::Raw ? 16 : 0);
+
+    if (const std::int64_t* _ = std::get_if<std::int64_t>(&data_)) {
+        (void)_;
+        return kObjectHeader;
+    }
+    if (const std::string* s = std::get_if<std::string>(&data_)) {
+        // embstr shares one allocation with the header; raw pays for a second.
+        return kObjectHeader + s->capacity() + (encoding_ == ObjEncoding::Raw ? 16 : 0);
+    }
+
+    // Collections: charge the packed bytes where the encoding is contiguous,
+    // and a per-element estimate where it is not.
+    if (const ListValue* l = list()) {
+        std::size_t total = kObjectHeader;
+        for (const Listpack& node : l->nodes()) total += node.totalBytes();
+        return total;
+    }
+    if (const HashValue* h = hash()) {
+        if (h->encoding() == ObjEncoding::ListPack) {
+            return kObjectHeader + h->listpack().totalBytes();
+        }
+        std::size_t total = kObjectHeader;
+        for (const std::string& s : h->flatten()) total += s.size() + 48;
+        return total;
+    }
+    if (const SetValue* s = set()) {
+        if (s->encoding() == ObjEncoding::IntSet)   return kObjectHeader + s->intset().byteSize();
+        if (s->encoding() == ObjEncoding::ListPack) return kObjectHeader + s->listpack().totalBytes();
+        std::size_t total = kObjectHeader;
+        for (const std::string& m : s->members()) total += m.size() + 48;
+        return total;
+    }
+    if (const ZSetValue* z = zset()) {
+        if (z->encoding() == ObjEncoding::ListPack) {
+            return kObjectHeader + z->listpack().totalBytes();
+        }
+        std::size_t total = kObjectHeader;
+        for (const auto& [member, score] : z->all()) total += member.size() + 96;
+        return total;
+    }
+    return kObjectHeader;
 }
 
 }  // namespace mnemos::core

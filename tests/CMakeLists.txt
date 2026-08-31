@@ -4,7 +4,10 @@ set(MNEMOS_TESTS
     test_resp
     test_dict
     test_object
-    test_listpack)
+    test_listpack
+    test_intset
+    test_skiplist
+    test_collections)
 
 foreach(test_name IN LISTS MNEMOS_TESTS)
     add_executable(${test_name} ${test_name}.cpp)

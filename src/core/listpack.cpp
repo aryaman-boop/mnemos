@@ -3,7 +3,7 @@
 #include <cstring>
 #include <limits>
 
-#include "core/object.h"
+#include "core/encoding.h"
 
 namespace mnemos::core {
 namespace {

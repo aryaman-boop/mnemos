@@ -73,4 +73,76 @@ void time(CommandContext&);
 void lastsave(CommandContext&);
 void shutdown(CommandContext&);
 
+// --- list_commands.cpp ------------------------------------------------------
+void lpush(CommandContext&);
+void rpush(CommandContext&);
+void lpushx(CommandContext&);
+void rpushx(CommandContext&);
+void lpop(CommandContext&);
+void rpop(CommandContext&);
+void llen(CommandContext&);
+void lrange(CommandContext&);
+void lindex(CommandContext&);
+void lset(CommandContext&);
+void lrem(CommandContext&);
+void ltrim(CommandContext&);
+void lpos(CommandContext&);
+void rpoplpush(CommandContext&);
+void lmove(CommandContext&);
+
+// --- hash_commands.cpp ------------------------------------------------------
+void hset(CommandContext&);
+void hsetnx(CommandContext&);
+void hmset(CommandContext&);
+void hget(CommandContext&);
+void hmget(CommandContext&);
+void hdel(CommandContext&);
+void hlen(CommandContext&);
+void hexists(CommandContext&);
+void hstrlen(CommandContext&);
+void hkeys(CommandContext&);
+void hvals(CommandContext&);
+void hgetall(CommandContext&);
+void hincrby(CommandContext&);
+void hincrbyfloat(CommandContext&);
+void hrandfield(CommandContext&);
+
+// --- set_commands.cpp -------------------------------------------------------
+void sadd(CommandContext&);
+void srem(CommandContext&);
+void scard(CommandContext&);
+void sismember(CommandContext&);
+void smismember(CommandContext&);
+void smembers(CommandContext&);
+void spop(CommandContext&);
+void srandmember(CommandContext&);
+void smove(CommandContext&);
+void sinter(CommandContext&);
+void sunion(CommandContext&);
+void sdiff(CommandContext&);
+void sinterstore(CommandContext&);
+void sunionstore(CommandContext&);
+void sdiffstore(CommandContext&);
+void sintercard(CommandContext&);
+
+// --- zset_commands.cpp ------------------------------------------------------
+void zadd(CommandContext&);
+void zrem(CommandContext&);
+void zscore(CommandContext&);
+void zmscore(CommandContext&);
+void zcard(CommandContext&);
+void zincrby(CommandContext&);
+void zrank(CommandContext&);
+void zrevrank(CommandContext&);
+void zrange(CommandContext&);
+void zrevrange(CommandContext&);
+void zrangebyscore(CommandContext&);
+void zrevrangebyscore(CommandContext&);
+void zcount(CommandContext&);
+void zremrangebyrank(CommandContext&);
+void zremrangebyscore(CommandContext&);
+void zpopmin(CommandContext&);
+void zpopmax(CommandContext&);
+void zrandmember(CommandContext&);
+
 }  // namespace mnemos::server::cmd

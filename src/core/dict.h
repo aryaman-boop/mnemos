@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <functional>
 #include <random>
+#include <utility>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -49,8 +50,28 @@ public:
 
     ~Dict() { clear(); }
 
+    // Copying would have to duplicate every chained entry; callers that need a
+    // copy rebuild from the logical contents instead. Moving is cheap and is
+    // required because the declared destructor suppresses the implicit move.
     Dict(const Dict&)            = delete;
     Dict& operator=(const Dict&) = delete;
+
+    Dict(Dict&& other) noexcept { swap(other); }
+    Dict& operator=(Dict&& other) noexcept {
+        if (this != &other) {
+            clear();
+            swap(other);
+        }
+        return *this;
+    }
+
+    void swap(Dict& other) noexcept {
+        std::swap(tables_[0], other.tables_[0]);
+        std::swap(tables_[1], other.tables_[1]);
+        std::swap(used_[0], other.used_[0]);
+        std::swap(used_[1], other.used_[1]);
+        std::swap(rehash_index_, other.rehash_index_);
+    }
 
     std::size_t size() const { return used_[0] + used_[1]; }
     bool empty() const { return size() == 0; }

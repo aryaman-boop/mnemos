@@ -40,6 +40,11 @@ jobs:
       - name: Interop tests against real redis-cli
         run: ./scripts/interop_test.sh
 
+      # The strongest check available: identical command sequences are run
+      # against mnemos and a real redis-server, and every reply is compared.
+      - name: Differential test against real redis-server
+        run: ./scripts/differential_test.sh
+
   sanitizers:
     name: asan+ubsan
     runs-on: ubuntu-latest

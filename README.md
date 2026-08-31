@@ -79,24 +79,22 @@ no third-party libraries for the server, the tests, or CI.
   strings, push frames.
 - **Single-threaded event loop** — kqueue on macOS/BSD, epoll on Linux. Every
   command is atomic without locking.
-- **Real encodings.** Strings are `int`, `embstr`, or `raw` depending on
-  content and length; small collections use the genuine listpack format, byte
-  for byte. `OBJECT ENCODING` reports what's actually in memory.
+- **All five types** — strings, lists, hashes, sets and sorted sets.
+- **Real encodings.** Strings are `int`, `embstr`, or `raw`. Collections use
+  the genuine `listpack`, `intset`, `quicklist`, `hashtable` and `skiplist`
+  representations and convert between them on the same thresholds Redis uses.
+  `OBJECT ENCODING` reports what's actually in memory, not a guess.
 - **Incremental rehashing.** The hash table grows a bucket at a time across
   operations instead of stalling on a large resize, and `SCAN` uses the
   reverse-binary cursor so iteration stays correct across a resize.
 - **TTLs** with both lazy and active expiry, including `EXPIRE`'s
   `NX`/`XX`/`GT`/`LT` options.
-- **60 commands** — the string family, the full key/TTL surface, `SCAN` with
-  `MATCH`/`COUNT`/`TYPE`, plus `OBJECT`, `INFO`, `CONFIG`, `COMMAND`, `CLIENT`
-  and `DEBUG`.
+- **~125 commands** — the string, list, hash, set and sorted-set families, the
+  full key/TTL surface, `SCAN` with `MATCH`/`COUNT`/`TYPE`, plus `OBJECT`,
+  `INFO`, `CONFIG`, `COMMAND`, `CLIENT` and `DEBUG`.
 
 ### Not there yet
 
-Lists, hashes, sets and sorted sets are next, then pub/sub, transactions,
-persistence and replication:
-
-- [ ] Collection types (lists, hashes, sets, sorted sets)
 - [ ] Pub/sub and keyspace notifications
 - [ ] `MULTI` / `EXEC` / `WATCH`
 - [ ] RDB persistence — in the real format, so files are portable
@@ -127,12 +125,23 @@ bar that matters here.
 ```bash
 ctest --test-dir build --output-on-failure   # unit tests
 ./scripts/interop_test.sh                    # drives the real redis-cli
+./scripts/differential_test.sh               # compares against a real redis-server
 ```
 
-The interop suite runs 51 assertions through the genuine `redis-cli` against a
-live server, covering encodings, TTL edge cases, and error formats. Unit tests
-cover protocol parsing under byte-by-byte fragmentation, `SCAN` during a
-rehash, and the listpack format against bytes extracted from a real Redis.
+The **differential test** is the one that matters most: it starts mnemos and a
+real `redis-server` side by side, runs identical command sequences against
+both, and compares every reply. Unit tests can only show that mnemos agrees
+with itself; this shows it agrees with the thing it's imitating, including on
+edge cases nobody thinks to write a test for — negative `LREM` counts,
+`ZADD GT/LT`, exclusive score ranges, `WRONGTYPE` on every command, and the
+rule that a collection is deleted once its last element is removed. All 23
+suites currently match byte for byte against Redis 8.10.1.
+
+The interop suite adds 51 assertions driven through the genuine `redis-cli`.
+Unit tests cover protocol parsing under byte-by-byte fragmentation, `SCAN`
+during a rehash, skiplist ranks cross-checked against a sorted reference, and
+the listpack and intset formats against bytes extracted from a real Redis via
+`DUMP`.
 
 CI runs everything on Linux and macOS, plus a pass under AddressSanitizer and
 UndefinedBehaviorSanitizer.
@@ -141,7 +150,7 @@ UndefinedBehaviorSanitizer.
 
 ```
 src/net/       event loop, RESP parsing and serialisation
-src/core/      value objects, encodings, listpack, dict
+src/core/      value objects, encodings, listpack, intset, skiplist, dict
 src/server/    server, connections, databases, commands
 src/persist/   RDB and AOF                          (in progress)
 src/repl/      replication                          (in progress)
