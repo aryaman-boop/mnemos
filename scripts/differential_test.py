@@ -62,6 +62,21 @@ class Client:
             if n == -1:
                 return ("nil", None)
             return ("array", [self._read() for _ in range(n)])
+        # RESP3. A push is deliberately kept distinct from an array here: that
+        # separation is the whole point of the frame, so collapsing the two
+        # would hide the one thing these suites exist to check.
+        if kind == b">":
+            return ("push", [self._read() for _ in range(int(rest))])
+        if kind == b"~":
+            return ("set", [self._read() for _ in range(int(rest))])
+        if kind == b"%":
+            return ("map", [self._read() for _ in range(int(rest) * 2)])
+        if kind == b"_":
+            return ("nil", None)
+        if kind == b"#":
+            return ("bool", rest == b"t")
+        if kind == b",":
+            return ("double", rest.decode())
         raise ValueError(f"{self.name}: unexpected reply byte {kind!r}")
 
     def cmd(self, *args):
@@ -70,6 +85,12 @@ class Client:
             b = a.encode() if isinstance(a, str) else a
             out += b"$%d\r\n%s\r\n" % (len(b), b)
         self.sock.sendall(out)
+        return self._read()
+
+    def read_pushed(self):
+        """Reads a frame nobody asked for -- a delivered message. Blocks on the
+        socket timeout, so a message that never arrives fails the suite rather
+        than passing quietly."""
         return self._read()
 
     def close(self):
@@ -90,6 +111,15 @@ def normalise(reply, unordered=False):
 # Command sequences. Each entry is (description, [commands], flags).
 #   unordered -- reply order is unspecified, so sort before comparing
 #   shape     -- reply is random; compare only the type and length
+#   min_redis -- the behaviour only exists from this reference version onward;
+#                against an older redis-server the suite is skipped, not failed
+#   two_clients -- the suite needs a second connection to each server, because
+#                what it tests is one connection observing another. Every
+#                command is then prefixed with the connection index, and two
+#                pseudo-commands are available:
+#                  (i, "@recv")   read one unsolicited frame on connection i
+#                  (i, "@hello3") switch connection i to RESP3, ignoring the
+#                                 reply, whose contents are server-specific
 SUITES = [
     ("list: push/pop/range", [
         ("DEL", "l"), ("RPUSH", "l", "a", "b", "c"), ("LPUSH", "l", "z"),
@@ -248,14 +278,76 @@ SUITES = [
         ("ZPOPMIN", "nonexistent"),
     ], {}),
     ("encodings: reported honestly", [
-        ("DEL", "e1", "e2", "e3", "e4", "e5", "e6"),
-        ("RPUSH", "e1", "a", "b", "c"), ("OBJECT", "ENCODING", "e1"),
+        ("DEL", "e1", "e2", "e3", "e5", "e6"),
+        ("RPUSH", "e1", "a", "b", "c"),
         ("HSET", "e2", "f", "v"), ("OBJECT", "ENCODING", "e2"),
         ("SADD", "e3", "1", "2", "3"), ("OBJECT", "ENCODING", "e3"),
-        ("SADD", "e4", "a", "b"), ("OBJECT", "ENCODING", "e4"),
         ("ZADD", "e5", "1", "a"), ("OBJECT", "ENCODING", "e5"),
         ("SET", "e6", "12345"), ("OBJECT", "ENCODING", "e6"),
         ("TYPE", "e1"), ("TYPE", "e2"), ("TYPE", "e3"), ("TYPE", "e5"),
+    ], {}),
+    # Redis 7.2 is where small lists and small non-integer sets gained their
+    # own listpack encoding; before it they report quicklist and hashtable.
+    # mnemos targets current Redis, so an older reference is out of date here,
+    # not a disagreement worth failing on.
+    ("encodings: listpack collections", [
+        ("DEL", "e1", "e4"),
+        ("RPUSH", "e1", "a", "b", "c"), ("OBJECT", "ENCODING", "e1"),
+        ("SADD", "e4", "a", "b"), ("OBJECT", "ENCODING", "e4"),
+    ], {"min_redis": (7, 2)}),
+    ("pubsub: subscribe, publish, deliver", [
+        (0, "SUBSCRIBE", "news"),
+        (1, "PUBSUB", "CHANNELS"),
+        (1, "PUBSUB", "NUMSUB", "news", "absent"),
+        (1, "PUBSUB", "NUMPAT"),
+        (1, "PUBLISH", "news", "hello"), (0, "@recv"),
+        (1, "PUBLISH", "absent", "nobody is listening"),
+        (0, "SUBSCRIBE", "news"),             # already subscribed: count holds
+        (0, "UNSUBSCRIBE", "absent"),         # never subscribed: still confirmed
+        (0, "UNSUBSCRIBE"),                   # bare form drops everything
+        (0, "UNSUBSCRIBE"),                   # ... and then has nothing to name
+        (1, "PUBSUB", "CHANNELS"),
+        (1, "PUBLISH", "news", "after unsubscribe"),
+    ], {"two_clients": True}),
+    ("pubsub: patterns", [
+        (0, "PSUBSCRIBE", "news.*"),
+        (1, "PUBSUB", "NUMPAT"),
+        (1, "PUBSUB", "CHANNELS"),            # a pattern is not a channel
+        (1, "PUBLISH", "news.tech", "x"), (0, "@recv"),
+        (1, "PUBLISH", "sports", "y"),
+        (0, "PSUBSCRIBE", "news.*"),
+        (0, "PUNSUBSCRIBE", "never.subscribed"),
+        (0, "PUNSUBSCRIBE"),
+        (0, "PUNSUBSCRIBE"),
+        (1, "PUBSUB", "NUMPAT"),
+    ], {"two_clients": True}),
+    ("pubsub: resp2 subscriber mode is restricted", [
+        (0, "SUBSCRIBE", "gate"),
+        (0, "GET", "anything"),               # rejected, and names the command
+        (0, "PUBLISH", "gate", "x"),          # publishing is rejected too
+        (0, "PUBSUB", "CHANNELS"),
+        (0, "PING"),                          # allowed, but shaped as a message
+        (0, "PING", "payload"),
+        (0, "RESET"),                         # clears the subscription
+        (0, "PING"),
+        (0, "GET", "anything"),
+        (1, "PUBSUB", "NUMSUB", "gate"),
+    ], {"two_clients": True}),
+    ("pubsub: resp3 pushes", [
+        (0, "@hello3"),
+        (0, "SUBSCRIBE", "r3"),
+        (0, "GET", "unrelated"),              # RESP3 tags pushes, so no gate
+        (1, "PUBLISH", "r3", "payload"), (0, "@recv"),
+        (0, "PSUBSCRIBE", "r3.*"),
+        (1, "PUBLISH", "r3.sub", "patterned"), (0, "@recv"),
+        (0, "UNSUBSCRIBE", "r3"),
+        (0, "PUNSUBSCRIBE", "r3.*"),
+    ], {"two_clients": True}),
+    ("pubsub: arity and errors", [
+        ("SUBSCRIBE",), ("PSUBSCRIBE",), ("PUNSUBSCRIBE", "one"),
+        ("PUBLISH",), ("PUBLISH", "c"), ("PUBLISH", "c", "m", "extra"),
+        ("PUBSUB",), ("PUBSUB", "BOGUS"), ("PUBSUB", "NUMPAT", "extra"),
+        ("PUBSUB", "CHANNELS", "a", "b"), ("PUBSUB", "NUMSUB"),
     ], {}),
     ("wrongtype errors", [
         ("DEL", "w"), ("SET", "w", "string"),
@@ -280,21 +372,49 @@ SUITES = [
 ]
 
 
+def server_version(client):
+    """The reference server's version, as a comparable tuple. Suites tagged
+    `min_redis` are skipped below it."""
+    kind, value = client.cmd("INFO", "server")
+    if kind != "bulk":
+        return (0, 0, 0)
+    for line in value.splitlines():
+        if line.startswith("redis_version:"):
+            parts = line.split(":", 1)[1].strip().split(".")
+            return tuple(int(p) for p in parts[:3] if p.isdigit())
+    return (0, 0, 0)
+
+
+def issue(client, args):
+    """Runs one step against one connection. `args` is a command, or one of the
+    pseudo-commands described above the suite table."""
+    if args[0] == "@recv":
+        return client.read_pushed()
+    if args[0] == "@hello3":
+        client.cmd("HELLO", "3")
+        return ("status", "hello3")
+    return client.cmd(*args)
+
+
 def run_suite(a, b, name, commands, flags):
     unordered = flags.get("unordered", False)
     failures = []
-    for cmd in commands:
+    for entry in commands:
+        if flags.get("two_clients"):
+            index, args = entry[0], entry[1:]
+        else:
+            index, args = 0, entry
         try:
-            ra = a.cmd(*cmd)
+            ra = issue(a[index], args)
         except Exception as e:
             ra = ("exception", str(e))
         try:
-            rb = b.cmd(*cmd)
+            rb = issue(b[index], args)
         except Exception as e:
             rb = ("exception", str(e))
 
         if normalise(ra, unordered) != normalise(rb, unordered):
-            failures.append((cmd, ra, rb))
+            failures.append((args, ra, rb))
     return failures
 
 
@@ -302,18 +422,33 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mnemos-port", type=int, default=7401)
     ap.add_argument("--redis-port", type=int, default=7402)
+    # Quiet prints only mismatches and the verdict. A green run of 23 suites is
+    # 23 lines that say nothing; the one line that matters is the last.
+    ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
-    mnemos = Client(args.mnemos_port, "mnemos")
-    redis = Client(args.redis_port, "redis")
-    mnemos.cmd("FLUSHALL")
-    redis.cmd("FLUSHALL")
+    # Two connections each: the pub/sub suites need one to watch and one to act.
+    mnemos = [Client(args.mnemos_port, f"mnemos[{i}]") for i in range(2)]
+    redis = [Client(args.redis_port, f"redis[{i}]") for i in range(2)]
+    mnemos[0].cmd("FLUSHALL")
+    redis[0].cmd("FLUSHALL")
+
+    reference = server_version(redis[0])
 
     total_failures = 0
+    skipped = 0
     for name, commands, flags in SUITES:
+        required = flags.get("min_redis")
+        if required and reference < required:
+            skipped += 1
+            if not args.quiet:
+                want = ".".join(str(n) for n in required)
+                print(f"  skip {name} (needs redis >= {want})")
+            continue
         failures = run_suite(mnemos, redis, name, commands, flags)
         if not failures:
-            print(f"  ok   {name}")
+            if not args.quiet:
+                print(f"  ok   {name}")
         else:
             print(f"  FAIL {name}")
             for cmd, ra, rb in failures:
@@ -322,13 +457,18 @@ def main():
                 print(f"           redis : {rb}")
             total_failures += len(failures)
 
-    mnemos.close()
-    redis.close()
-    print()
+    for connection in mnemos + redis:
+        connection.close()
+    if not args.quiet:
+        print()
     if total_failures:
         print(f"{total_failures} differing repl{'y' if total_failures == 1 else 'ies'}")
         return 1
-    print("all replies identical")
+    if skipped:
+        print(f"all replies identical ({skipped} suite{'' if skipped == 1 else 's'} "
+              f"skipped: reference redis is older than the behaviour tested)")
+    else:
+        print("all replies identical")
     return 0
 
 

@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "core/strings.h"
 #include "server/command_table.h"
 
 namespace mnemos::server {
@@ -23,6 +24,15 @@ constexpr std::size_t kQueryBufferTrimThreshold = 32 * 1024;
 constexpr int kServerCronIntervalMs = 100;  // Redis's default hz = 10
 // How many bytes of arguments to quote back in an unknown-command error.
 constexpr std::size_t kUnknownCommandArgsLimit = 128;
+
+// The commands a RESP2 subscriber may still issue. Matched by canonical name,
+// so the client's spelling of it does not matter.
+bool isAllowedInSubscriberMode(std::string_view name) {
+    return name == "subscribe" || name == "unsubscribe" ||
+           name == "psubscribe" || name == "punsubscribe" ||
+           name == "ssubscribe" || name == "sunsubscribe" ||
+           name == "ping" || name == "quit" || name == "reset";
+}
 
 bool setNonBlocking(int fd) {
     const int flags = ::fcntl(fd, F_GETFL, 0);
@@ -276,6 +286,21 @@ void Server::dispatch(Client& client, std::vector<std::string>& argv) {
         return;
     }
 
+    // RESP2 has no way to tell a push apart from a reply, so a subscribed
+    // client on that protocol is restricted to the handful of commands whose
+    // replies cannot be confused for a message. RESP3 tags pushes and is free.
+    if (client.protocolVersion() == 2 && client.inSubscriberMode() &&
+        !isAllowedInSubscriberMode(spec->name)) {
+        std::string named(spec->name);
+        if ((spec->flags & flags::kContainer) && argv.size() > 1) {
+            named += "|" + core::toLower(argv[1]);
+        }
+        writer.error("ERR Can't execute '" + named +
+                     "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / "
+                     "RESET are allowed in this context");
+        return;
+    }
+
     client.setLastCommand(std::string(spec->name));
 
     CommandContext ctx{
@@ -325,9 +350,38 @@ void Server::flushOutput(Client& client) {
     if (client.shouldClose()) closeClient(fd);
 }
 
+Client* Server::clientByFd(int fd) {
+    auto it = clients_.find(fd);
+    return it == clients_.end() ? nullptr : it->second.get();
+}
+
+void Server::queueWrite(int fd, std::string_view bytes) {
+    Client* client = clientByFd(fd);
+    if (!client) return;
+    client->outputBuffer().append(bytes);
+    // The recipient is idle as far as the loop knows, so nothing would other-
+    // wise come back to flush this. Asking for writability does.
+    loop_.modFd(fd, net::Ev::Read | net::Ev::Write);
+}
+
+void Server::clearSubscriptions(Client& client) {
+    for (const std::string& channel : client.channels()) {
+        pubsub_.unsubscribeChannel(channel, client.fd());
+    }
+    for (const std::string& pattern : client.patterns()) {
+        pubsub_.unsubscribePattern(pattern, client.fd());
+    }
+    client.channels().clear();
+    client.patterns().clear();
+}
+
 void Server::closeClient(int fd) {
     auto it = clients_.find(fd);
     if (it == clients_.end()) return;
+
+    // Done before the deferred-close branch below: a connection on its way out
+    // must stop receiving messages immediately, not once the loop unwinds.
+    clearSubscriptions(*it->second);
 
     if (fd == executing_fd_) {
         // We are inside this client's own command handler; tearing the object

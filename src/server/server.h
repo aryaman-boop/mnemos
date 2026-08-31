@@ -3,13 +3,16 @@
 
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include "net/event_loop.h"
 #include "net/resp.h"
 #include "server/db.h"
+#include "server/pubsub.h"
 
 namespace mnemos::server {
 
@@ -68,6 +71,19 @@ public:
     const std::string& lastCommand() const { return last_command_; }
     void setLastCommand(std::string c) { last_command_ = std::move(c); }
 
+    // The client's own view of its subscriptions. The server keeps the inverse
+    // index; this side is what UNSUBSCRIBE with no arguments enumerates, and
+    // what disconnect cleanup walks.
+    std::set<std::string>&       channels() { return channels_; }
+    const std::set<std::string>& channels() const { return channels_; }
+    std::set<std::string>&       patterns() { return patterns_; }
+    const std::set<std::string>& patterns() const { return patterns_; }
+
+    // Channels and patterns together, which is the number every subscribe and
+    // unsubscribe confirmation reports back.
+    std::size_t subscriptionCount() const { return channels_.size() + patterns_.size(); }
+    bool inSubscriberMode() const { return subscriptionCount() > 0; }
+
     // Discards the already-parsed prefix of the query buffer. Called once per
     // read cycle rather than per command, so a pipeline of N commands costs one
     // memmove instead of N.
@@ -89,6 +105,9 @@ private:
 
     std::string         output_buffer_;
     std::size_t         output_sent_ = 0;
+
+    std::set<std::string> channels_;
+    std::set<std::string> patterns_;
 
     std::int64_t        created_at_ms_        = 0;
     std::int64_t        last_interaction_ms_  = 0;
@@ -131,6 +150,21 @@ public:
 
     const std::unordered_map<int, std::unique_ptr<Client>>& clients() const { return clients_; }
 
+    // Null when the fd has already been closed -- which is exactly what a
+    // publish walking a stale subscriber list needs to be able to discover.
+    Client* clientByFd(int fd);
+
+    PubSub& pubsub() { return pubsub_; }
+
+    // Appends an out-of-band reply to another connection and asks the loop to
+    // drain it. Command handlers write to their own client through ReplyWriter;
+    // this is the only way bytes reach a client that did not ask for them.
+    void queueWrite(int fd, std::string_view bytes);
+
+    // Drops every subscription held by a connection. Called on disconnect and
+    // by RESET, both of which must leave no entry pointing at the fd.
+    void clearSubscriptions(Client& client);
+
     const std::string& runId() const { return run_id_; }
 
     // Closes a connection and frees its state. Safe to call from a command
@@ -156,6 +190,7 @@ private:
     std::uint64_t                                   next_client_id_ = 1;
     std::int64_t                                    start_time_ms_  = 0;
     std::uint64_t                                   dirty_          = 0;
+    PubSub                                          pubsub_;
     Stats                                           stats_;
     std::string                                     run_id_;
     int                                             executing_fd_ = -1;

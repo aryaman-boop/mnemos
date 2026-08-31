@@ -39,6 +39,10 @@ inline constexpr std::uint32_t kAdmin    = 1u << 2;
 inline constexpr std::uint32_t kNoAuth   = 1u << 3;  // allowed before AUTH
 inline constexpr std::uint32_t kFast     = 1u << 4;  // O(1)
 inline constexpr std::uint32_t kLoading  = 1u << 5;  // allowed while loading
+// A command whose first argument selects a subcommand. Redis identifies these
+// by their "parent|sub" full name in errors, so anything that quotes a command
+// name back at the client has to know which commands are containers.
+inline constexpr std::uint32_t kContainer = 1u << 6;
 }  // namespace flags
 
 struct CommandSpec {
@@ -71,6 +75,12 @@ void notAFloat(net::ReplyWriter& w);
 void outOfRange(net::ReplyWriter& w);
 void wrongArgs(net::ReplyWriter& w, std::string_view command);
 void ok(net::ReplyWriter& w);
+// A subcommand nobody recognises, versus one that exists but was called wrong.
+// Redis distinguishes the two and client tooling keys off the difference.
+void unknownSubcommand(net::ReplyWriter& w, std::string_view container,
+                       std::string_view sub);
+void subcommandSyntaxError(net::ReplyWriter& w, std::string_view container,
+                           std::string_view sub);
 }  // namespace replies
 
 }  // namespace mnemos::server

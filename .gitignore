@@ -1,4 +1,5 @@
 build/
+build-asan/
 cmake-build-*/
 compile_commands.json
 .cache/
@@ -9,3 +10,6 @@ compile_commands.json
 .DS_Store
 .vscode/
 .idea/
+
+# Personal Claude Code settings (effort level, compaction window)
+.claude/settings.local.json

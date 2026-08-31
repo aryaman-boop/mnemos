@@ -29,6 +29,15 @@ const std::vector<CommandSpec>& table() {
         {"reset",         cmd::reset,               1,  kFast | kNoAuth | kLoading,   0,  0,  0},
         {"client",        cmd::client,             -2,  kAdmin | kNoAuth | kLoading,  0,  0,  0},
 
+        // Pub/sub carries no keys, so first/last/step stay zero -- the channel
+        // name is not a keyspace key and must not be routed as one.
+        {"subscribe",     cmd::subscribe,          -2,  kFast | kLoading,             0,  0,  0},
+        {"unsubscribe",   cmd::unsubscribe,        -1,  kFast | kLoading,             0,  0,  0},
+        {"psubscribe",    cmd::psubscribe,         -2,  kFast | kLoading,             0,  0,  0},
+        {"punsubscribe",  cmd::punsubscribe,       -1,  kFast | kLoading,             0,  0,  0},
+        {"publish",       cmd::publish,             3,  kFast | kLoading,             0,  0,  0},
+        {"pubsub",        cmd::pubsub,             -2,  kFast | kLoading | kContainer, 0, 0,  0},
+
         {"set",           cmd::set,                -3,  kWrite,                       1,  1,  1},
         {"get",           cmd::get,                 2,  kReadOnly | kFast,            1,  1,  1},
         {"getset",        cmd::getset,              3,  kWrite | kFast,               1,  1,  1},
@@ -205,6 +214,26 @@ void wrongArgs(net::ReplyWriter& w, std::string_view command) {
     w.error(msg);
 }
 void ok(net::ReplyWriter& w) { w.simpleString("OK"); }
+
+void unknownSubcommand(net::ReplyWriter& w, std::string_view container,
+                       std::string_view sub) {
+    std::string msg = "ERR unknown subcommand '";
+    msg.append(sub);
+    msg.append("'. Try ");
+    msg.append(container);
+    msg.append(" HELP.");
+    w.error(msg);
+}
+
+void subcommandSyntaxError(net::ReplyWriter& w, std::string_view container,
+                           std::string_view sub) {
+    std::string msg = "ERR unknown subcommand or wrong number of arguments for '";
+    msg.append(sub);
+    msg.append("'. Try ");
+    msg.append(container);
+    msg.append(" HELP.");
+    w.error(msg);
+}
 
 }  // namespace replies
 

@@ -73,6 +73,14 @@ void time(CommandContext&);
 void lastsave(CommandContext&);
 void shutdown(CommandContext&);
 
+// --- pubsub_commands.cpp ----------------------------------------------------
+void subscribe(CommandContext&);
+void unsubscribe(CommandContext&);
+void psubscribe(CommandContext&);
+void punsubscribe(CommandContext&);
+void publish(CommandContext&);
+void pubsub(CommandContext&);
+
 // --- list_commands.cpp ------------------------------------------------------
 void lpush(CommandContext&);
 void rpush(CommandContext&);

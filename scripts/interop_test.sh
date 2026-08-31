@@ -32,13 +32,18 @@ fi
 
 r() { redis-cli -p "$PORT" "$@"; }
 
+# MNEMOS_QUIET=1 suppresses the per-assertion and section chatter, leaving only
+# failures and the final tally. Set by scripts/check.sh.
+QUIET="${MNEMOS_QUIET:-0}"
+say() { [[ "$QUIET" == "1" ]] || echo "$@"; }
+
 # check <description> <expected> <command...>
 check() {
     local description="$1" expected="$2"; shift 2
     local actual
     actual="$(r "$@" 2>&1)"
     if [[ "$actual" == "$expected" ]]; then
-        printf '  ok   %s\n' "$description"
+        [[ "$QUIET" == "1" ]] || printf '  ok   %s\n' "$description"
         pass=$((pass + 1))
     else
         printf '  FAIL %s\n       expected: %q\n         actual: %q\n' \
@@ -62,7 +67,7 @@ if ! redis-cli -p "$PORT" PING >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "== connection =="
+say "== connection =="
 check "PING"                  "PONG"           PING
 check "PING with message"     "hello"          PING hello
 check "ECHO"                  "hi there"       ECHO "hi there"
@@ -70,7 +75,7 @@ check "SELECT valid db"       "OK"             SELECT 3
 check "SELECT out of range"   "ERR DB index is out of range" SELECT 99
 r SELECT 0 >/dev/null
 
-echo "== strings =="
+say "== strings =="
 check "SET"                   "OK"             SET k1 v1
 check "GET"                   "v1"             GET k1
 check "GET missing"           ""               GET nosuchkey
@@ -83,7 +88,7 @@ check "GETRANGE negative"     "bcd"            GETRANGE app -3 -1
 check "SETRANGE"              "4"              SETRANGE app 0 Z
 check "GETRANGE after patch"  "Zbcd"           GETRANGE app 0 -1
 
-echo "== integers =="
+say "== integers =="
 r SET counter 10 >/dev/null
 check "INCR"                  "11"             INCR counter
 check "INCRBY"                "16"             INCRBY counter 5
@@ -94,7 +99,7 @@ check "INCR overflow"         "ERR increment or decrement would overflow" INCR m
 check "INCRBYFLOAT trims"     "10.5"           INCRBYFLOAT f1 10.5
 check "INCRBYFLOAT integral"  "11"             INCRBYFLOAT f1 0.5
 
-echo "== encodings =="
+say "== encodings =="
 r SET enc_int 12345 >/dev/null
 check "int encoding"          "int"            OBJECT ENCODING enc_int
 r SET enc_emb short >/dev/null
@@ -107,7 +112,7 @@ r SET enc_promote 100 >/dev/null
 r APPEND enc_promote abc >/dev/null
 check "APPEND promotes to raw" "raw"           OBJECT ENCODING enc_promote
 
-echo "== expiry =="
+say "== expiry =="
 r SET ttlkey v EX 100 >/dev/null
 check "TTL set"               "100"            TTL ttlkey
 check "PERSIST"               "1"              PERSIST ttlkey
@@ -123,7 +128,7 @@ sleep 0.3
 check "key expired lazily"    ""               GET shortlived
 check "EXISTS after expiry"   "0"              EXISTS shortlived
 
-echo "== keyspace =="
+say "== keyspace =="
 r FLUSHDB >/dev/null
 r MSET a 1 b 2 c 3 >/dev/null
 check "DBSIZE"                "3"              DBSIZE
@@ -138,7 +143,7 @@ check "renamed value"         "v"              GET dst
 check "COPY"                  "1"              COPY dst dst2
 check "COPY no replace"       "0"              COPY dst dst2
 
-echo "== errors =="
+say "== errors =="
 check "unknown command"       "ERR unknown command 'NOPE', with args beginning with: " NOPE
 check "wrong arity"           "ERR wrong number of arguments for 'get' command" GET
 check "SET bad option"        "ERR syntax error" SET k v BOGUS

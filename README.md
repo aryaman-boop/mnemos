@@ -89,13 +89,16 @@ no third-party libraries for the server, the tests, or CI.
   reverse-binary cursor so iteration stays correct across a resize.
 - **TTLs** with both lazy and active expiry, including `EXPIRE`'s
   `NX`/`XX`/`GT`/`LT` options.
-- **~125 commands** — the string, list, hash, set and sorted-set families, the
+- **~131 commands** — the string, list, hash, set and sorted-set families, the
   full key/TTL surface, `SCAN` with `MATCH`/`COUNT`/`TYPE`, plus `OBJECT`,
   `INFO`, `CONFIG`, `COMMAND`, `CLIENT` and `DEBUG`.
+- **Pub/sub** — channel and pattern subscriptions, with messages framed as
+  plain arrays for RESP2 subscribers and as push frames for RESP3 ones, and
+  the RESP2 subscriber-mode command restriction that goes with it.
 
 ### Not there yet
 
-- [ ] Pub/sub and keyspace notifications
+- [ ] Sharded pub/sub (`SSUBSCRIBE`/`SPUBLISH`) and keyspace notifications
 - [ ] `MULTI` / `EXEC` / `WATCH`
 - [ ] RDB persistence — in the real format, so files are portable
 - [ ] AOF with rewrite
@@ -121,6 +124,14 @@ Fast enough that it won't be the bottleneck in local development, which is the
 bar that matters here.
 
 ## Testing
+
+```bash
+./scripts/check.sh          # build + every suite; quiet unless something fails
+./scripts/check.sh --unit   # unit tests only, for the inner loop
+```
+
+`check.sh` is the one command that answers "is the tree good?". The suites also
+run standalone:
 
 ```bash
 ctest --test-dir build --output-on-failure   # unit tests

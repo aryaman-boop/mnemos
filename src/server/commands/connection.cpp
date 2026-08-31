@@ -12,6 +12,14 @@ void ping(CommandContext& ctx) {
         replies::wrongArgs(ctx.reply, "ping");
         return;
     }
+    // A RESP2 subscriber gets its pong shaped like a message instead, because
+    // that is the only frame shape it is prepared to read in this state.
+    if (ctx.client.protocolVersion() == 2 && ctx.client.inSubscriberMode()) {
+        ctx.reply.pushHeader(2);
+        ctx.reply.bulk("pong");
+        ctx.reply.bulk(ctx.argc() == 2 ? ctx.arg(1) : "");
+        return;
+    }
     // PING with an argument echoes it as a bulk string; bare PING is the cheaper
     // simple-string +PONG, which is why health checks use the bare form.
     if (ctx.argc() == 2) ctx.reply.bulk(ctx.arg(1));
@@ -118,6 +126,7 @@ void quit(CommandContext& ctx) {
 }
 
 void reset(CommandContext& ctx) {
+    ctx.server.clearSubscriptions(ctx.client);
     ctx.client.setDbIndex(0);
     ctx.client.setProtocolVersion(2);
     ctx.client.setName("");
