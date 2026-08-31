@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace mnemos::test {
@@ -17,17 +18,34 @@ inline void reportFailure(const char* file, int line, const std::string& what) {
     ++g_failures;
 }
 
+// Renders a value for a failure message. Falls back gracefully so a check can
+// be written against any comparable type without teaching the harness about it.
+template <typename T>
+std::string describe(const T& value) {
+    if constexpr (requires { std::to_string(value); }) {
+        return std::to_string(value);
+    } else if constexpr (std::is_constructible_v<std::string, const T&>) {
+        return std::string(value);
+    } else if constexpr (requires { value.begin(); value.end(); }) {
+        std::string out = "[";
+        bool first = true;
+        for (const auto& item : value) {
+            if (!first) out += ", ";
+            first = false;
+            out += describe(item);
+        }
+        return out + "]";
+    } else {
+        return "<unprintable>";
+    }
+}
+
 template <typename A, typename B>
 void checkEqual(const A& actual, const B& expected, const char* expr, const char* file, int line) {
     ++g_checks;
     if (!(actual == expected)) {
-        std::string msg = std::string(expr) + "\n       actual: ";
-        if constexpr (requires { std::to_string(actual); }) msg += std::to_string(actual);
-        else msg += std::string(actual);
-        msg += "\n     expected: ";
-        if constexpr (requires { std::to_string(expected); }) msg += std::to_string(expected);
-        else msg += std::string(expected);
-        reportFailure(file, line, msg);
+        reportFailure(file, line, std::string(expr) + "\n       actual: " + describe(actual) +
+                                      "\n     expected: " + describe(expected));
     }
 }
 
