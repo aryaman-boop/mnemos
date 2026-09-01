@@ -97,8 +97,7 @@ collection; a collection that becomes empty is *deleted* (`EXISTS` → 0).
 
 ## Not yet implemented
 
-Sharded pub/sub (`SSUBSCRIBE`/`SPUBLISH`), keyspace notifications,
-`MULTI`/`EXEC`/`WATCH`, RDB persistence
+Keyspace notifications, `MULTI`/`EXEC`/`WATCH`, RDB persistence
 (real format), AOF with rewrite, replication over `PSYNC`, the MCP server.
 Unimplemented commands return an unknown-command error rather than a stub.
 

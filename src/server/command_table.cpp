@@ -29,13 +29,19 @@ const std::vector<CommandSpec>& table() {
         {"reset",         cmd::reset,               1,  kFast | kNoAuth | kLoading,   0,  0,  0},
         {"client",        cmd::client,             -2,  kAdmin | kNoAuth | kLoading,  0,  0,  0},
 
-        // Pub/sub carries no keys, so first/last/step stay zero -- the channel
-        // name is not a keyspace key and must not be routed as one.
+        // Global pub/sub carries no keys, so first/last/step stay zero -- the
+        // channel name is not a keyspace key and must not be routed as one.
         {"subscribe",     cmd::subscribe,          -2,  kFast | kLoading,             0,  0,  0},
         {"unsubscribe",   cmd::unsubscribe,        -1,  kFast | kLoading,             0,  0,  0},
         {"psubscribe",    cmd::psubscribe,         -2,  kFast | kLoading,             0,  0,  0},
         {"punsubscribe",  cmd::punsubscribe,       -1,  kFast | kLoading,             0,  0,  0},
         {"publish",       cmd::publish,             3,  kFast | kLoading,             0,  0,  0},
+        // The shard variants do report key positions: a cluster hashes the
+        // shard channel name to pick the node, so a proxy has to find it the
+        // same way it finds a key, even though the name is not a key.
+        {"ssubscribe",    cmd::ssubscribe,         -2,  kFast | kLoading,             1, -1,  1},
+        {"sunsubscribe",  cmd::sunsubscribe,       -1,  kFast | kLoading,             1, -1,  1},
+        {"spublish",      cmd::spublish,            3,  kFast | kLoading,             1,  1,  1},
         {"pubsub",        cmd::pubsub,             -2,  kFast | kLoading | kContainer, 0, 0,  0},
 
         {"set",           cmd::set,                -3,  kWrite,                       1,  1,  1},

@@ -366,13 +366,17 @@ void Server::queueWrite(int fd, std::string_view bytes) {
 
 void Server::clearSubscriptions(Client& client) {
     for (const std::string& channel : client.channels()) {
-        pubsub_.unsubscribeChannel(channel, client.fd());
+        pubsub_.unsubscribeChannel(ChannelKind::Global, channel, client.fd());
     }
     for (const std::string& pattern : client.patterns()) {
         pubsub_.unsubscribePattern(pattern, client.fd());
     }
+    for (const std::string& channel : client.shardChannels()) {
+        pubsub_.unsubscribeChannel(ChannelKind::Shard, channel, client.fd());
+    }
     client.channels().clear();
     client.patterns().clear();
+    client.shardChannels().clear();
 }
 
 void Server::closeClient(int fd) {

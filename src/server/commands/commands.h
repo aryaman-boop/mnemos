@@ -78,7 +78,10 @@ void subscribe(CommandContext&);
 void unsubscribe(CommandContext&);
 void psubscribe(CommandContext&);
 void punsubscribe(CommandContext&);
+void ssubscribe(CommandContext&);
+void sunsubscribe(CommandContext&);
 void publish(CommandContext&);
+void spublish(CommandContext&);
 void pubsub(CommandContext&);
 
 // --- list_commands.cpp ------------------------------------------------------

@@ -15,6 +15,51 @@ namespace mnemos::server::cmd {
 
 namespace {
 
+// The three subscription namespaces. They differ only in the set the client
+// holds them in, the word in the confirmation, and the count it reports.
+enum class SubKind { Channel, Pattern, Shard };
+
+std::set<std::string>& heldBy(Client& client, SubKind kind) {
+    switch (kind) {
+        case SubKind::Pattern: return client.patterns();
+        case SubKind::Shard:   return client.shardChannels();
+        case SubKind::Channel: break;
+    }
+    return client.channels();
+}
+
+// Shard subscriptions are counted on their own, so an SSUBSCRIBE reports how
+// many shard channels the client holds and says nothing about its ordinary
+// subscriptions -- and vice versa.
+std::size_t reportedCount(const Client& client, SubKind kind) {
+    return kind == SubKind::Shard ? client.shardChannels().size()
+                                  : client.subscriptionCount();
+}
+
+std::string_view confirmKind(SubKind kind, bool subscribing) {
+    switch (kind) {
+        case SubKind::Pattern: return subscribing ? "psubscribe" : "punsubscribe";
+        case SubKind::Shard:   return subscribing ? "ssubscribe" : "sunsubscribe";
+        case SubKind::Channel: break;
+    }
+    return subscribing ? "subscribe" : "unsubscribe";
+}
+
+void updateRegistry(CommandContext& ctx, SubKind kind, const std::string& name,
+                    bool subscribing) {
+    PubSub&   pubsub = ctx.server.pubsub();
+    const int fd     = ctx.client.fd();
+    if (kind == SubKind::Pattern) {
+        if (subscribing) pubsub.subscribePattern(name, fd);
+        else             pubsub.unsubscribePattern(name, fd);
+        return;
+    }
+    const ChannelKind channel_kind =
+        kind == SubKind::Shard ? ChannelKind::Shard : ChannelKind::Global;
+    if (subscribing) pubsub.subscribeChannel(channel_kind, name, fd);
+    else             pubsub.unsubscribeChannel(channel_kind, name, fd);
+}
+
 // A subscribe/unsubscribe confirmation: kind, what it applied to, and the
 // client's remaining subscription count.
 void confirm(CommandContext& ctx, std::string_view kind,
@@ -27,10 +72,15 @@ void confirm(CommandContext& ctx, std::string_view kind,
 }
 
 // Encodes one message for a single recipient and hands it to the server.
-void deliver(Server& server, int fd, std::string_view kind,
+//
+// A publisher can be one of its own subscribers, and Redis answers its PUBLISH
+// before delivering that copy back to it. Handlers write their reply straight
+// into the same output buffer, so a self-directed frame is parked in `to_self`
+// and appended once the receiver count has been written.
+void deliver(CommandContext& ctx, int fd, std::string_view kind,
              const std::string* pattern, const std::string& channel,
-             const std::string& payload) {
-    Client* recipient = server.clientByFd(fd);
+             const std::string& payload, std::string& to_self) {
+    Client* recipient = ctx.server.clientByFd(fd);
     if (!recipient) return;
 
     std::string      frame;
@@ -40,32 +90,32 @@ void deliver(Server& server, int fd, std::string_view kind,
     if (pattern) writer.bulk(*pattern);
     writer.bulk(channel);
     writer.bulk(payload);
-    server.queueWrite(fd, frame);
+
+    if (fd == ctx.client.fd()) to_self += frame;
+    else                       ctx.server.queueWrite(fd, frame);
 }
 
-void subscribeTo(CommandContext& ctx, bool by_pattern) {
+// Sends whatever the publisher owes itself. Called after the reply, never before.
+void flushToSelf(CommandContext& ctx, const std::string& to_self) {
+    if (!to_self.empty()) ctx.server.queueWrite(ctx.client.fd(), to_self);
+}
+
+void subscribeTo(CommandContext& ctx, SubKind kind) {
     Client& client = ctx.client;
     for (std::size_t i = 1; i < ctx.argc(); ++i) {
         const std::string& name = ctx.arg(i);
-        if (by_pattern) {
-            if (client.patterns().insert(name).second) {
-                ctx.server.pubsub().subscribePattern(name, client.fd());
-            }
-        } else {
-            if (client.channels().insert(name).second) {
-                ctx.server.pubsub().subscribeChannel(name, client.fd());
-            }
+        if (heldBy(client, kind).insert(name).second) {
+            updateRegistry(ctx, kind, name, true);
         }
         // Redis confirms every name given, including one already subscribed.
-        confirm(ctx, by_pattern ? "psubscribe" : "subscribe", &name,
-                client.subscriptionCount());
+        confirm(ctx, confirmKind(kind, true), &name, reportedCount(client, kind));
     }
 }
 
-void unsubscribeFrom(CommandContext& ctx, bool by_pattern) {
-    Client&                 client = ctx.client;
-    std::set<std::string>&  held   = by_pattern ? client.patterns() : client.channels();
-    const std::string_view  kind   = by_pattern ? "punsubscribe" : "unsubscribe";
+void unsubscribeFrom(CommandContext& ctx, SubKind kind) {
+    Client&                client = ctx.client;
+    std::set<std::string>& held   = heldBy(client, kind);
+    const std::string_view word   = confirmKind(kind, false);
 
     std::vector<std::string> targets;
     if (ctx.argc() > 1) {
@@ -75,43 +125,76 @@ void unsubscribeFrom(CommandContext& ctx, bool by_pattern) {
         // Nothing to drop still owes the client one frame, with a null name --
         // otherwise a client waiting for confirmation would hang forever.
         if (targets.empty()) {
-            confirm(ctx, kind, nullptr, client.subscriptionCount());
+            confirm(ctx, word, nullptr, reportedCount(client, kind));
             return;
         }
     }
 
     for (const std::string& name : targets) {
-        if (held.erase(name) > 0) {
-            if (by_pattern) ctx.server.pubsub().unsubscribePattern(name, client.fd());
-            else            ctx.server.pubsub().unsubscribeChannel(name, client.fd());
-        }
-        confirm(ctx, kind, &name, client.subscriptionCount());
+        if (held.erase(name) > 0) updateRegistry(ctx, kind, name, false);
+        confirm(ctx, word, &name, reportedCount(client, kind));
+    }
+}
+
+// Delivery to an exact channel, shared by PUBLISH and SPUBLISH. The subscriber
+// list is copied before delivery: writing to a peer can close it, and a closed
+// peer is unsubscribed, which would invalidate an iterator over the live set.
+std::int64_t deliverToChannel(CommandContext& ctx, ChannelKind kind,
+                              std::string_view message_kind,
+                              const std::string& channel, const std::string& payload,
+                              std::string& to_self) {
+    std::vector<int> targets;
+    if (const std::set<int>* subscribers =
+            ctx.server.pubsub().channelSubscribers(kind, channel)) {
+        targets.assign(subscribers->begin(), subscribers->end());
+    }
+    for (int fd : targets) {
+        deliver(ctx, fd, message_kind, nullptr, channel, payload, to_self);
+    }
+    return static_cast<std::int64_t>(targets.size());
+}
+
+// PUBSUB CHANNELS and PUBSUB SHARDCHANNELS differ only in which namespace they
+// enumerate; the same holds for NUMSUB and SHARDNUMSUB.
+bool listChannels(CommandContext& ctx, ChannelKind kind) {
+    if (ctx.argc() > 3) return false;
+    const std::string* pattern = ctx.argc() == 3 ? &ctx.arg(2) : nullptr;
+    std::vector<std::string> names;
+    for (std::string& name : ctx.server.pubsub().channelNames(kind)) {
+        if (pattern && !core::globMatch(*pattern, name)) continue;
+        names.push_back(std::move(name));
+    }
+    ctx.reply.bulkArray(names);
+    return true;
+}
+
+void numSub(CommandContext& ctx, ChannelKind kind) {
+    // A flat channel/count array, not a map: Redis kept this shape even in
+    // RESP3, so mirroring it matters more than the tidier encoding would.
+    ctx.reply.arrayHeader(static_cast<std::int64_t>((ctx.argc() - 2) * 2));
+    for (std::size_t i = 2; i < ctx.argc(); ++i) {
+        ctx.reply.bulk(ctx.arg(i));
+        ctx.reply.integer(static_cast<std::int64_t>(
+            ctx.server.pubsub().channelSubscriberCount(kind, ctx.arg(i))));
     }
 }
 
 }  // namespace
 
-void subscribe(CommandContext& ctx)    { subscribeTo(ctx, false); }
-void psubscribe(CommandContext& ctx)   { subscribeTo(ctx, true); }
-void unsubscribe(CommandContext& ctx)  { unsubscribeFrom(ctx, false); }
-void punsubscribe(CommandContext& ctx) { unsubscribeFrom(ctx, true); }
+void subscribe(CommandContext& ctx)     { subscribeTo(ctx, SubKind::Channel); }
+void psubscribe(CommandContext& ctx)    { subscribeTo(ctx, SubKind::Pattern); }
+void ssubscribe(CommandContext& ctx)    { subscribeTo(ctx, SubKind::Shard); }
+void unsubscribe(CommandContext& ctx)   { unsubscribeFrom(ctx, SubKind::Channel); }
+void punsubscribe(CommandContext& ctx)  { unsubscribeFrom(ctx, SubKind::Pattern); }
+void sunsubscribe(CommandContext& ctx)  { unsubscribeFrom(ctx, SubKind::Shard); }
 
 void publish(CommandContext& ctx) {
     const std::string& channel = ctx.arg(1);
     const std::string& payload = ctx.arg(2);
 
-    std::int64_t receivers = 0;
-
-    // Copied before delivery: writing to a peer can close it, and a closed peer
-    // is unsubscribed, which would invalidate an iterator over the live set.
-    std::vector<int> targets;
-    if (const std::set<int>* subscribers = ctx.server.pubsub().channelSubscribers(channel)) {
-        targets.assign(subscribers->begin(), subscribers->end());
-    }
-    for (int fd : targets) {
-        deliver(ctx.server, fd, "message", nullptr, channel, payload);
-        ++receivers;
-    }
+    std::string  to_self;
+    std::int64_t receivers =
+        deliverToChannel(ctx, ChannelKind::Global, "message", channel, payload, to_self);
 
     // No index for patterns: every one of them is tested against the channel.
     std::vector<std::pair<std::string, std::vector<int>>> pattern_targets;
@@ -122,37 +205,40 @@ void publish(CommandContext& ctx) {
     }
     for (const auto& [pattern, fds] : pattern_targets) {
         for (int fd : fds) {
-            deliver(ctx.server, fd, "pmessage", &pattern, channel, payload);
+            deliver(ctx, fd, "pmessage", &pattern, channel, payload, to_self);
             ++receivers;
         }
     }
 
     ctx.reply.integer(receivers);
+    flushToSelf(ctx, to_self);
+}
+
+// SPUBLISH reaches shard subscribers only. Patterns are deliberately not
+// consulted: in a cluster a pattern subscription lives on every node, so
+// matching one here would defeat the point of routing by slot.
+void spublish(CommandContext& ctx) {
+    std::string to_self;
+    ctx.reply.integer(deliverToChannel(ctx, ChannelKind::Shard, "smessage", ctx.arg(1),
+                                       ctx.arg(2), to_self));
+    flushToSelf(ctx, to_self);
 }
 
 void pubsub(CommandContext& ctx) {
     const std::string sub = core::toLower(ctx.arg(1));
 
-    if (sub == "channels" && ctx.argc() <= 3) {
-        const std::string* pattern = ctx.argc() == 3 ? &ctx.arg(2) : nullptr;
-        std::vector<std::string> names;
-        for (std::string& name : ctx.server.pubsub().channelNames()) {
-            if (pattern && !core::globMatch(*pattern, name)) continue;
-            names.push_back(std::move(name));
-        }
-        ctx.reply.bulkArray(names);
+    const bool is_channels      = sub == "channels";
+    const bool is_shardchannels = sub == "shardchannels";
+    if (is_channels || is_shardchannels) {
+        const ChannelKind kind = is_shardchannels ? ChannelKind::Shard : ChannelKind::Global;
+        if (listChannels(ctx, kind)) return;
+        // The subcommand exists but was handed too many patterns.
+        replies::subcommandSyntaxError(ctx.reply, "PUBSUB", ctx.arg(1));
         return;
     }
 
-    if (sub == "numsub") {
-        // A flat channel/count array, not a map: Redis kept this shape even in
-        // RESP3, so mirroring it matters more than the tidier encoding would.
-        ctx.reply.arrayHeader(static_cast<std::int64_t>((ctx.argc() - 2) * 2));
-        for (std::size_t i = 2; i < ctx.argc(); ++i) {
-            ctx.reply.bulk(ctx.arg(i));
-            ctx.reply.integer(
-                static_cast<std::int64_t>(ctx.server.pubsub().channelSubscriberCount(ctx.arg(i))));
-        }
+    if (sub == "numsub" || sub == "shardnumsub") {
+        numSub(ctx, sub == "shardnumsub" ? ChannelKind::Shard : ChannelKind::Global);
         return;
     }
 
@@ -167,10 +253,7 @@ void pubsub(CommandContext& ctx) {
         return;
     }
 
-    // CHANNELS exists but was handed too many patterns; anything else is a
-    // subcommand this server has never heard of.
-    if (sub == "channels") replies::subcommandSyntaxError(ctx.reply, "PUBSUB", ctx.arg(1));
-    else                   replies::unknownSubcommand(ctx.reply, "PUBSUB", ctx.arg(1));
+    replies::unknownSubcommand(ctx.reply, "PUBSUB", ctx.arg(1));
 }
 
 }  // namespace mnemos::server::cmd

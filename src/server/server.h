@@ -78,11 +78,18 @@ public:
     const std::set<std::string>& channels() const { return channels_; }
     std::set<std::string>&       patterns() { return patterns_; }
     const std::set<std::string>& patterns() const { return patterns_; }
+    std::set<std::string>&       shardChannels() { return shard_channels_; }
+    const std::set<std::string>& shardChannels() const { return shard_channels_; }
 
-    // Channels and patterns together, which is the number every subscribe and
-    // unsubscribe confirmation reports back.
+    // Channels and patterns together, which is the number an ordinary subscribe
+    // or unsubscribe confirmation reports back. Shard subscriptions are counted
+    // apart from it: Redis holds them in their own dictionary, so SSUBSCRIBE
+    // reports how many shard channels the client has and nothing else.
     std::size_t subscriptionCount() const { return channels_.size() + patterns_.size(); }
-    bool inSubscriberMode() const { return subscriptionCount() > 0; }
+    // Every namespace together, which is what decides subscriber mode.
+    bool inSubscriberMode() const {
+        return subscriptionCount() + shard_channels_.size() > 0;
+    }
 
     // Discards the already-parsed prefix of the query buffer. Called once per
     // read cycle rather than per command, so a pipeline of N commands costs one
@@ -108,6 +115,7 @@ private:
 
     std::set<std::string> channels_;
     std::set<std::string> patterns_;
+    std::set<std::string> shard_channels_;
 
     std::int64_t        created_at_ms_        = 0;
     std::int64_t        last_interaction_ms_  = 0;

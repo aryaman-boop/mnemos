@@ -333,6 +333,60 @@ SUITES = [
         (0, "GET", "anything"),
         (1, "PUBSUB", "NUMSUB", "gate"),
     ], {"two_clients": True}),
+    # Shard pub/sub (Redis 7.0) is a second channel namespace. SPUBLISH reaches
+    # only SSUBSCRIBE-ers -- never a plain subscriber, and never a pattern, since
+    # in a cluster a pattern subscription lives on every node and matching one
+    # here would defeat routing by slot.
+    ("pubsub: shard channels", [
+        (0, "SSUBSCRIBE", "shard.a"),
+        (1, "PUBSUB", "SHARDCHANNELS"),
+        (1, "PUBSUB", "SHARDNUMSUB", "shard.a", "absent"),
+        (1, "PUBSUB", "CHANNELS"),            # a shard channel is not a channel
+        (1, "SPUBLISH", "shard.a", "hello"), (0, "@recv"),
+        (1, "PUBLISH", "shard.a", "same name, other namespace"),
+        (1, "SPUBLISH", "absent", "nobody is listening"),
+        (0, "SSUBSCRIBE", "shard.a"),         # already subscribed: count holds
+        (0, "SUNSUBSCRIBE", "absent"),        # never subscribed: still confirmed
+        (0, "SUNSUBSCRIBE"),                  # bare form drops everything
+        (0, "SUNSUBSCRIBE"),                  # ... and then has nothing to name
+        (1, "PUBSUB", "SHARDCHANNELS"),
+        (1, "SPUBLISH", "shard.a", "after unsubscribe"),
+    ], {"two_clients": True, "min_redis": (7, 0)}),
+    # The two namespaces are counted apart: an SSUBSCRIBE confirmation reports
+    # only shard channels, and SUBSCRIBE/PSUBSCRIBE only the ordinary ones.
+    # Subscriber mode, though, is about holding any subscription at all.
+    ("pubsub: shard subscriptions are counted apart", [
+        (0, "SUBSCRIBE", "mixed"),
+        (0, "SSUBSCRIBE", "mixed"),           # same name, different namespace
+        (0, "PSUBSCRIBE", "mix*"),
+        (0, "SSUBSCRIBE", "mixed.2"),
+        (1, "PUBLISH", "mixed", "global"),
+        (0, "@recv"), (0, "@recv"),           # the channel, then the pattern
+        (1, "SPUBLISH", "mixed", "shard"), (0, "@recv"),  # the pattern stays out
+        (0, "UNSUBSCRIBE", "mixed"),
+        (0, "PUNSUBSCRIBE", "mix*"),
+        (0, "SSUBSCRIBE", "mixed.3"),         # still shard-subscribed, so still counted
+        (0, "GET", "gated"),                  # and still barred from RESP2 commands
+        (0, "SUNSUBSCRIBE", "mixed.2"),
+        (0, "SUNSUBSCRIBE", "mixed.3"),
+        (0, "SUNSUBSCRIBE"),
+        (0, "GET", "gated"),                  # last subscription gone: allowed again
+    ], {"two_clients": True, "min_redis": (7, 0)}),
+    # SHARDCHANNELS enumerates a hash table, so its order is Redis's business,
+    # not part of the contract.
+    ("pubsub: shard introspection", [
+        (0, "SSUBSCRIBE", "s1"),
+        (0, "SSUBSCRIBE", "s2"),
+        (1, "PUBSUB", "SHARDCHANNELS"),
+        (1, "PUBSUB", "SHARDCHANNELS", "s*"),
+        (1, "PUBSUB", "SHARDCHANNELS", "nomatch*"),
+        (1, "PUBSUB", "SHARDNUMSUB", "s1", "s2", "absent"),
+        (1, "PUBSUB", "SHARDNUMSUB"),
+        (1, "PUBSUB", "NUMPAT"),              # a shard channel is not a pattern
+        (1, "PUBSUB", "CHANNELS"),
+        (0, "SUNSUBSCRIBE", "s1"),
+        (0, "SUNSUBSCRIBE", "s2"),
+    ], {"two_clients": True, "unordered": True, "min_redis": (7, 0)}),
     ("pubsub: resp3 pushes", [
         (0, "@hello3"),
         (0, "SUBSCRIBE", "r3"),
@@ -340,15 +394,35 @@ SUITES = [
         (1, "PUBLISH", "r3", "payload"), (0, "@recv"),
         (0, "PSUBSCRIBE", "r3.*"),
         (1, "PUBLISH", "r3.sub", "patterned"), (0, "@recv"),
+        (0, "PUBLISH", "r3", "from a subscriber"),  # reply first, then its own copy
+        (0, "@recv"),
         (0, "UNSUBSCRIBE", "r3"),
         (0, "PUNSUBSCRIBE", "r3.*"),
     ], {"two_clients": True}),
+    # Connection 0 is RESP3 from the suite above, connection 1 is still RESP2:
+    # one delivery, framed two different ways, and a publisher that is itself a
+    # subscriber -- its own message is queued before the reply to its SPUBLISH.
+    ("pubsub: shard pushes and several subscribers", [
+        (0, "SSUBSCRIBE", "sp"),
+        (1, "SSUBSCRIBE", "sp"),
+        (0, "PUBSUB", "SHARDNUMSUB", "sp"),   # RESP3 tags pushes, so no gate
+        (0, "SPUBLISH", "sp", "to both"),
+        (0, "@recv"), (1, "@recv"),
+        (0, "SUNSUBSCRIBE", "sp"),
+        (1, "SUNSUBSCRIBE", "sp"),
+    ], {"two_clients": True, "min_redis": (7, 0)}),
     ("pubsub: arity and errors", [
         ("SUBSCRIBE",), ("PSUBSCRIBE",), ("PUNSUBSCRIBE", "one"),
         ("PUBLISH",), ("PUBLISH", "c"), ("PUBLISH", "c", "m", "extra"),
         ("PUBSUB",), ("PUBSUB", "BOGUS"), ("PUBSUB", "NUMPAT", "extra"),
         ("PUBSUB", "CHANNELS", "a", "b"), ("PUBSUB", "NUMSUB"),
     ], {}),
+    ("pubsub: shard arity and errors", [
+        ("SSUBSCRIBE",), ("SUNSUBSCRIBE", "one"),
+        ("SPUBLISH",), ("SPUBLISH", "c"), ("SPUBLISH", "c", "m", "extra"),
+        ("PUBSUB", "SHARDCHANNELS", "a", "b"),
+        ("PUBSUB", "SHARDNUMPAT"),
+    ], {"min_redis": (7, 0)}),
     ("wrongtype errors", [
         ("DEL", "w"), ("SET", "w", "string"),
         ("LPUSH", "w", "x"), ("HSET", "w", "f", "v"), ("SADD", "w", "m"),

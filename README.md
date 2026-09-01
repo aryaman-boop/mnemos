@@ -89,16 +89,17 @@ no third-party libraries for the server, the tests, or CI.
   reverse-binary cursor so iteration stays correct across a resize.
 - **TTLs** with both lazy and active expiry, including `EXPIRE`'s
   `NX`/`XX`/`GT`/`LT` options.
-- **~131 commands** — the string, list, hash, set and sorted-set families, the
+- **~134 commands** — the string, list, hash, set and sorted-set families, the
   full key/TTL surface, `SCAN` with `MATCH`/`COUNT`/`TYPE`, plus `OBJECT`,
   `INFO`, `CONFIG`, `COMMAND`, `CLIENT` and `DEBUG`.
-- **Pub/sub** — channel and pattern subscriptions, with messages framed as
-  plain arrays for RESP2 subscribers and as push frames for RESP3 ones, and
-  the RESP2 subscriber-mode command restriction that goes with it.
+- **Pub/sub** — channel, pattern and shard subscriptions
+  (`SSUBSCRIBE`/`SPUBLISH`), with messages framed as plain arrays for RESP2
+  subscribers and as push frames for RESP3 ones, and the RESP2
+  subscriber-mode command restriction that goes with it.
 
 ### Not there yet
 
-- [ ] Sharded pub/sub (`SSUBSCRIBE`/`SPUBLISH`) and keyspace notifications
+- [ ] Keyspace notifications
 - [ ] `MULTI` / `EXEC` / `WATCH`
 - [ ] RDB persistence — in the real format, so files are portable
 - [ ] AOF with rewrite
@@ -147,7 +148,7 @@ edge cases nobody thinks to write a test for — negative `LREM` counts,
 `ZADD GT/LT`, exclusive score ranges, `WRONGTYPE` on every command, and the
 rule that a collection is deleted once its last element is removed. Pub/sub is
 covered the same way, over two connections per server, so a delivered message
-has to arrive on the right one with the right framing. All 29 suites match byte
+has to arrive on the right one with the right framing. All 34 suites match byte
 for byte against Redis 8.10.1; a suite that depends on behaviour newer than the
 reference server is skipped and counted, never quietly passed.
 

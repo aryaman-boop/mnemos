@@ -22,12 +22,20 @@ bool removeFrom(Map& map, const std::string& key, int fd) {
 
 }  // namespace
 
-bool PubSub::subscribeChannel(const std::string& channel, int fd) {
-    return addTo(channels_, channel, fd);
+PubSub::ChannelMap& PubSub::mapFor(ChannelKind kind) {
+    return kind == ChannelKind::Shard ? shard_channels_ : channels_;
 }
 
-bool PubSub::unsubscribeChannel(const std::string& channel, int fd) {
-    return removeFrom(channels_, channel, fd);
+const PubSub::ChannelMap& PubSub::mapFor(ChannelKind kind) const {
+    return kind == ChannelKind::Shard ? shard_channels_ : channels_;
+}
+
+bool PubSub::subscribeChannel(ChannelKind kind, const std::string& channel, int fd) {
+    return addTo(mapFor(kind), channel, fd);
+}
+
+bool PubSub::unsubscribeChannel(ChannelKind kind, const std::string& channel, int fd) {
+    return removeFrom(mapFor(kind), channel, fd);
 }
 
 bool PubSub::subscribePattern(const std::string& pattern, int fd) {
@@ -38,20 +46,24 @@ bool PubSub::unsubscribePattern(const std::string& pattern, int fd) {
     return removeFrom(patterns_, pattern, fd);
 }
 
-const std::set<int>* PubSub::channelSubscribers(const std::string& channel) const {
-    auto it = channels_.find(channel);
-    return it == channels_.end() ? nullptr : &it->second;
+const std::set<int>* PubSub::channelSubscribers(ChannelKind kind,
+                                                const std::string& channel) const {
+    const ChannelMap& map = mapFor(kind);
+    auto it = map.find(channel);
+    return it == map.end() ? nullptr : &it->second;
 }
 
-std::vector<std::string> PubSub::channelNames() const {
+std::vector<std::string> PubSub::channelNames(ChannelKind kind) const {
+    const ChannelMap& map = mapFor(kind);
     std::vector<std::string> names;
-    names.reserve(channels_.size());
-    for (const auto& [name, subscribers] : channels_) names.push_back(name);
+    names.reserve(map.size());
+    for (const auto& [name, subscribers] : map) names.push_back(name);
     return names;
 }
 
-std::size_t PubSub::channelSubscriberCount(const std::string& channel) const {
-    const std::set<int>* subscribers = channelSubscribers(channel);
+std::size_t PubSub::channelSubscriberCount(ChannelKind kind,
+                                           const std::string& channel) const {
+    const std::set<int>* subscribers = channelSubscribers(kind, channel);
     return subscribers ? subscribers->size() : 0;
 }
 
