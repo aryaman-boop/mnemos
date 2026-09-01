@@ -4,6 +4,7 @@
 #include "core/strings.h"
 #include "server/commands/commands.h"
 #include "server/commands/type_helpers.h"
+#include "server/notify.h"
 #include "server/server.h"
 
 namespace mnemos::server::cmd {
@@ -35,6 +36,8 @@ void pushGeneric(CommandContext& ctx, bool at_front, bool require_existing) {
         else          list->pushBack(ctx.arg(i));
     }
     ctx.server.markDirty(ctx.argc() - 2);
+    // One event for the whole command, however many elements it pushed.
+    notifyKeyspaceEvent(ctx, notify::kList, at_front ? "lpush" : "rpush", ctx.arg(1));
     ctx.reply.integer(static_cast<std::int64_t>(list->size()));
 }
 
@@ -72,7 +75,10 @@ void popGeneric(CommandContext& ctx, bool from_front) {
         popped.push_back(std::move(*item));
     }
 
-    if (!popped.empty()) ctx.server.markDirty(popped.size());
+    if (!popped.empty()) {
+        ctx.server.markDirty(popped.size());
+        notifyKeyspaceEvent(ctx, notify::kList, from_front ? "lpop" : "rpop", ctx.arg(1));
+    }
     deleteIfEmpty(ctx, ctx.arg(1), *value);
 
     if (has_count) {
@@ -105,12 +111,22 @@ void moveGeneric(CommandContext& ctx, const std::string& source, const std::stri
         ctx.reply.nullBulk();
         return;
     }
-    deleteIfEmpty(ctx, source, *src);
-
+    // The destination is filled -- and announced -- before the source's pop is,
+    // which is the order Redis emits them in and the only order in which a
+    // subscriber never sees the element belong to neither list.
     Value* dst = lookupOrCreate(ctx, destination, ObjType::List, type_error);
     if (type_error || !dst) return;
     if (to_front) dst->list()->pushFront(*item);
     else          dst->list()->pushBack(*item);
+    notifyKeyspaceEvent(ctx, notify::kList, to_front ? "lpush" : "rpush", destination);
+    notifyKeyspaceEvent(ctx, notify::kList, from_front ? "lpop" : "rpop", source);
+
+    // Re-looked-up rather than reusing `src`: creating the destination may have
+    // rehashed the dict out from under it. When source and destination are the
+    // same key this also correctly finds it non-empty again.
+    if (Value* src_now = ctx.db.lookupWrite(source, ctx.nowMs())) {
+        deleteIfEmpty(ctx, source, *src_now);
+    }
 
     ctx.server.markDirty();
     ctx.reply.bulk(*item);
@@ -127,7 +143,7 @@ void rpop(CommandContext& ctx)   { popGeneric(ctx, false); }
 
 void llen(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::List, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::List, type_error);
     if (type_error) return;
     ctx.reply.integer(value ? static_cast<std::int64_t>(value->list()->size()) : 0);
 }
@@ -139,7 +155,7 @@ void lrange(CommandContext& ctx) {
         return;
     }
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::List, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::List, type_error);
     if (type_error) return;
     if (!value) {
         ctx.reply.arrayHeader(0);
@@ -155,7 +171,7 @@ void lindex(CommandContext& ctx) {
         return;
     }
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::List, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::List, type_error);
     if (type_error) return;
     if (!value) {
         ctx.reply.nullBulk();
@@ -184,6 +200,7 @@ void lset(CommandContext& ctx) {
         return;
     }
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kList, "lset", ctx.arg(1));
     replies::ok(ctx.reply);
 }
 
@@ -201,7 +218,10 @@ void lrem(CommandContext& ctx) {
         return;
     }
     const std::size_t removed = value->list()->removeValue(ctx.arg(3), count);
-    if (removed > 0) ctx.server.markDirty(removed);
+    if (removed > 0) {
+        ctx.server.markDirty(removed);
+        notifyKeyspaceEvent(ctx, notify::kList, "lrem", ctx.arg(1));
+    }
     deleteIfEmpty(ctx, ctx.arg(1), *value);
     ctx.reply.integer(static_cast<std::int64_t>(removed));
 }
@@ -221,6 +241,9 @@ void ltrim(CommandContext& ctx) {
     }
     value->list()->trim(start, stop);
     ctx.server.markDirty();
+    // Announced even when the range trimmed nothing: LTRIM reports on the key,
+    // not on the elements, and Redis fires it for every call that finds the key.
+    notifyKeyspaceEvent(ctx, notify::kList, "ltrim", ctx.arg(1));
     // Trimming to an empty range deletes the key outright.
     deleteIfEmpty(ctx, ctx.arg(1), *value);
     replies::ok(ctx.reply);
@@ -228,7 +251,7 @@ void ltrim(CommandContext& ctx) {
 
 void lpos(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::List, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::List, type_error);
     if (type_error) return;
 
     std::int64_t rank = 1, count = -1;

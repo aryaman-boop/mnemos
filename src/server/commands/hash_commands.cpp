@@ -8,6 +8,7 @@
 #include "core/strings.h"
 #include "server/commands/commands.h"
 #include "server/commands/type_helpers.h"
+#include "server/notify.h"
 #include "server/server.h"
 
 namespace mnemos::server::cmd {
@@ -47,6 +48,7 @@ void hset(CommandContext& ctx) {
         if (value->hash()->set(ctx.arg(i), ctx.arg(i + 1))) ++added;
     }
     ctx.server.markDirty((ctx.argc() - 2) / 2);
+    notifyKeyspaceEvent(ctx, notify::kHash, "hset", ctx.arg(1));
     ctx.reply.integer(added);
 }
 
@@ -62,12 +64,13 @@ void hsetnx(CommandContext& ctx) {
     }
     value->hash()->set(ctx.arg(2), ctx.arg(3));
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kHash, "hset", ctx.arg(1));
     ctx.reply.integer(1);
 }
 
 void hget(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::Hash, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::Hash, type_error);
     if (type_error) return;
     if (!value) {
         ctx.reply.nullBulk();
@@ -80,7 +83,7 @@ void hget(CommandContext& ctx) {
 
 void hmget(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::Hash, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::Hash, type_error);
     if (type_error) return;
 
     ctx.reply.arrayHeader(static_cast<std::int64_t>(ctx.argc() - 2));
@@ -108,28 +111,31 @@ void hdel(CommandContext& ctx) {
     for (std::size_t i = 2; i < ctx.argc(); ++i) {
         if (value->hash()->erase(ctx.arg(i))) ++removed;
     }
-    if (removed > 0) ctx.server.markDirty(static_cast<std::uint64_t>(removed));
+    if (removed > 0) {
+        ctx.server.markDirty(static_cast<std::uint64_t>(removed));
+        notifyKeyspaceEvent(ctx, notify::kHash, "hdel", ctx.arg(1));
+    }
     deleteIfEmpty(ctx, ctx.arg(1), *value);
     ctx.reply.integer(removed);
 }
 
 void hlen(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::Hash, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::Hash, type_error);
     if (type_error) return;
     ctx.reply.integer(value ? static_cast<std::int64_t>(value->hash()->size()) : 0);
 }
 
 void hexists(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::Hash, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::Hash, type_error);
     if (type_error) return;
     ctx.reply.integer(value && value->hash()->contains(ctx.arg(2)) ? 1 : 0);
 }
 
 void hstrlen(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::Hash, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::Hash, type_error);
     if (type_error) return;
     if (!value) {
         ctx.reply.integer(0);
@@ -141,7 +147,7 @@ void hstrlen(CommandContext& ctx) {
 
 void hkeys(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::Hash, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::Hash, type_error);
     if (type_error) return;
     if (!value) {
         ctx.reply.arrayHeader(0);
@@ -152,7 +158,7 @@ void hkeys(CommandContext& ctx) {
 
 void hvals(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::Hash, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::Hash, type_error);
     if (type_error) return;
     if (!value) {
         ctx.reply.arrayHeader(0);
@@ -163,7 +169,7 @@ void hvals(CommandContext& ctx) {
 
 void hgetall(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::Hash, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::Hash, type_error);
     if (type_error) return;
     if (!value) {
         ctx.reply.mapHeader(0);
@@ -204,6 +210,7 @@ void hincrby(CommandContext& ctx) {
     const std::int64_t result = current + delta;
     value->hash()->set(ctx.arg(2), std::to_string(result));
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kHash, "hincrby", ctx.arg(1));
     ctx.reply.integer(result);
 }
 
@@ -239,12 +246,13 @@ void hincrbyfloat(CommandContext& ctx) {
     const std::string formatted = formatLongDouble(result);
     value->hash()->set(ctx.arg(2), formatted);
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kHash, "hincrbyfloat", ctx.arg(1));
     ctx.reply.bulk(formatted);
 }
 
 void hrandfield(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::Hash, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::Hash, type_error);
     if (type_error) return;
 
     bool         has_count  = ctx.argc() > 2;
@@ -324,6 +332,8 @@ void hmset(CommandContext& ctx) {
         value->hash()->set(ctx.arg(i), ctx.arg(i + 1));
     }
     ctx.server.markDirty((ctx.argc() - 2) / 2);
+    // HMSET is HSET underneath, and announces itself as one.
+    notifyKeyspaceEvent(ctx, notify::kHash, "hset", ctx.arg(1));
     replies::ok(ctx.reply);
 }
 

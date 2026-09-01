@@ -27,12 +27,21 @@ using core::Value;
 Value* lookupTyped(CommandContext& ctx, const std::string& key, ObjType expected,
                    bool& type_error);
 
+// The read-path flavour. Identical in what it returns, but a miss raises the
+// `keymiss` notification -- Redis fires that from its read lookup only, so a
+// command that reaches for a key it is about to write stays silent.
+Value* lookupTypedRead(CommandContext& ctx, const std::string& key, ObjType expected,
+                       bool& type_error);
+
 // As above, but creates an empty collection of `expected` when the key is
 // absent. Returns nullptr only on a type error.
 Value* lookupOrCreate(CommandContext& ctx, const std::string& key, ObjType expected,
                       bool& type_error);
 
-// Removes `key` if its collection is now empty.
+// Removes `key` if its collection is now empty, announcing the `del` that
+// implies. The caller has already published its own event by then, which is the
+// order Redis emits the pair in: the mutation first, then the deletion it
+// caused.
 void deleteIfEmpty(CommandContext& ctx, const std::string& key, const Value& value);
 
 }  // namespace mnemos::server::cmd

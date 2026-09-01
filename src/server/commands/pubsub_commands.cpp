@@ -1,9 +1,8 @@
 // SUBSCRIBE, PUBLISH and friends.
 //
-// Pub/sub is the one place where a command writes to a connection other than
-// the one that issued it, so every reply here is built against the *recipient's*
-// protocol version rather than the publisher's: the same message goes out as a
-// plain array to a RESP2 subscriber and as a tagged push frame to a RESP3 one.
+// The subscription bookkeeping lives here; delivery itself is Server::publish-
+// Message, because keyspace notifications publish through exactly the same path
+// without going near a command handler.
 #include <string>
 #include <vector>
 
@@ -71,35 +70,6 @@ void confirm(CommandContext& ctx, std::string_view kind,
     ctx.reply.integer(static_cast<std::int64_t>(count));
 }
 
-// Encodes one message for a single recipient and hands it to the server.
-//
-// A publisher can be one of its own subscribers, and Redis answers its PUBLISH
-// before delivering that copy back to it. Handlers write their reply straight
-// into the same output buffer, so a self-directed frame is parked in `to_self`
-// and appended once the receiver count has been written.
-void deliver(CommandContext& ctx, int fd, std::string_view kind,
-             const std::string* pattern, const std::string& channel,
-             const std::string& payload, std::string& to_self) {
-    Client* recipient = ctx.server.clientByFd(fd);
-    if (!recipient) return;
-
-    std::string      frame;
-    net::ReplyWriter writer(frame, recipient->protocolVersion());
-    writer.pushHeader(pattern ? 4 : 3);
-    writer.bulk(kind);
-    if (pattern) writer.bulk(*pattern);
-    writer.bulk(channel);
-    writer.bulk(payload);
-
-    if (fd == ctx.client.fd()) to_self += frame;
-    else                       ctx.server.queueWrite(fd, frame);
-}
-
-// Sends whatever the publisher owes itself. Called after the reply, never before.
-void flushToSelf(CommandContext& ctx, const std::string& to_self) {
-    if (!to_self.empty()) ctx.server.queueWrite(ctx.client.fd(), to_self);
-}
-
 void subscribeTo(CommandContext& ctx, SubKind kind) {
     Client& client = ctx.client;
     for (std::size_t i = 1; i < ctx.argc(); ++i) {
@@ -134,24 +104,6 @@ void unsubscribeFrom(CommandContext& ctx, SubKind kind) {
         if (held.erase(name) > 0) updateRegistry(ctx, kind, name, false);
         confirm(ctx, word, &name, reportedCount(client, kind));
     }
-}
-
-// Delivery to an exact channel, shared by PUBLISH and SPUBLISH. The subscriber
-// list is copied before delivery: writing to a peer can close it, and a closed
-// peer is unsubscribed, which would invalidate an iterator over the live set.
-std::int64_t deliverToChannel(CommandContext& ctx, ChannelKind kind,
-                              std::string_view message_kind,
-                              const std::string& channel, const std::string& payload,
-                              std::string& to_self) {
-    std::vector<int> targets;
-    if (const std::set<int>* subscribers =
-            ctx.server.pubsub().channelSubscribers(kind, channel)) {
-        targets.assign(subscribers->begin(), subscribers->end());
-    }
-    for (int fd : targets) {
-        deliver(ctx, fd, message_kind, nullptr, channel, payload, to_self);
-    }
-    return static_cast<std::int64_t>(targets.size());
 }
 
 // PUBSUB CHANNELS and PUBSUB SHARDCHANNELS differ only in which namespace they
@@ -189,39 +141,14 @@ void punsubscribe(CommandContext& ctx)  { unsubscribeFrom(ctx, SubKind::Pattern)
 void sunsubscribe(CommandContext& ctx)  { unsubscribeFrom(ctx, SubKind::Shard); }
 
 void publish(CommandContext& ctx) {
-    const std::string& channel = ctx.arg(1);
-    const std::string& payload = ctx.arg(2);
-
-    std::string  to_self;
-    std::int64_t receivers =
-        deliverToChannel(ctx, ChannelKind::Global, "message", channel, payload, to_self);
-
-    // No index for patterns: every one of them is tested against the channel.
-    std::vector<std::pair<std::string, std::vector<int>>> pattern_targets;
-    for (const auto& [pattern, subscribers] : ctx.server.pubsub().patterns()) {
-        if (!core::globMatch(pattern, channel)) continue;
-        pattern_targets.emplace_back(pattern,
-                                     std::vector<int>(subscribers.begin(), subscribers.end()));
-    }
-    for (const auto& [pattern, fds] : pattern_targets) {
-        for (int fd : fds) {
-            deliver(ctx, fd, "pmessage", &pattern, channel, payload, to_self);
-            ++receivers;
-        }
-    }
-
-    ctx.reply.integer(receivers);
-    flushToSelf(ctx, to_self);
+    ctx.reply.integer(ctx.server.publishMessage(ctx.arg(1), ctx.arg(2)));
 }
 
 // SPUBLISH reaches shard subscribers only. Patterns are deliberately not
 // consulted: in a cluster a pattern subscription lives on every node, so
 // matching one here would defeat the point of routing by slot.
 void spublish(CommandContext& ctx) {
-    std::string to_self;
-    ctx.reply.integer(deliverToChannel(ctx, ChannelKind::Shard, "smessage", ctx.arg(1),
-                                       ctx.arg(2), to_self));
-    flushToSelf(ctx, to_self);
+    ctx.reply.integer(ctx.server.publishShardMessage(ctx.arg(1), ctx.arg(2)));
 }
 
 void pubsub(CommandContext& ctx) {

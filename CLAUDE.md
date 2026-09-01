@@ -79,9 +79,27 @@ shapes come from `replies::unknownSubcommand` and
 `replies::subcommandSyntaxError`.
 
 Collection commands must go through `type_helpers.h` — `lookupTyped`,
-`lookupOrCreate`, `deleteIfEmpty`. Those encode three rules that are easy to get
-wrong: WRONGTYPE stops the command; a write to a missing key creates the
-collection; a collection that becomes empty is *deleted* (`EXISTS` → 0).
+`lookupTypedRead`, `lookupOrCreate`, `deleteIfEmpty`. Those encode three rules
+that are easy to get wrong: WRONGTYPE stops the command; a write to a missing
+key creates the collection; a collection that becomes empty is *deleted*
+(`EXISTS` → 0). Use the `Read` flavour on read paths only — it is what raises
+`keymiss`.
+
+## Keyspace notifications
+
+Every mutating command raises its event through `notifyKeyspaceEvent`
+(`src/server/notify.h`); nothing publishes to `__keyspace@`/`__keyevent@`
+directly. Four rules, all of them checked by the differential suites:
+
+- The name is Redis's, not the command's: `INCR` → `incrby`, `ZINCRBY` and
+  `ZADD INCR` → `zincr`, `HMSET` → `hset`, `SINTERSTORE` → `sinterstore`.
+- A command that changes nothing says nothing — `SADD` of a member already
+  present, `ZADD NX` on an existing member, `EXPIRE ... XX` with no TTL.
+- Order is fixed: `new` first, then the command's own event, then the `del`
+  that `deleteIfEmpty` raises. Commands that move an element (`LMOVE`, `SMOVE`)
+  announce the destination before the source.
+- `n` (new keys) and `m` (key misses) are outside the `A` alias, yet `A`
+  swallows a set `n` in `CONFIG GET`'s output. Both halves of that are Redis's.
 
 ## Conventions
 
@@ -97,7 +115,7 @@ collection; a collection that becomes empty is *deleted* (`EXISTS` → 0).
 
 ## Not yet implemented
 
-Keyspace notifications, `MULTI`/`EXEC`/`WATCH`, RDB persistence
+`MULTI`/`EXEC`/`WATCH`, RDB persistence
 (real format), AOF with rewrite, replication over `PSYNC`, the MCP server.
 Unimplemented commands return an unknown-command error rather than a stub.
 

@@ -12,6 +12,7 @@
 #include "net/event_loop.h"
 #include "net/resp.h"
 #include "server/db.h"
+#include "server/notify.h"
 #include "server/pubsub.h"
 
 namespace mnemos::server {
@@ -26,6 +27,10 @@ struct Config {
     std::string  requirepass;           // empty => no auth
     std::string  dir          = ".";
     std::string  dbfilename   = "dump.rdb";
+    // notify-keyspace-events, as a mask of notify:: class bits. Zero -- no
+    // notifications at all -- is Redis's default, and deliberately so: the
+    // events cost a publish on every write.
+    std::uint32_t notify_flags = 0;
 };
 
 // Per-connection state. Mirrors Redis's client struct: an input buffer with a
@@ -164,6 +169,19 @@ public:
 
     PubSub& pubsub() { return pubsub_; }
 
+    // Sends `payload` to everyone subscribed to `channel`, and to every pattern
+    // that matches it. Returns how many deliveries that was, which is what
+    // PUBLISH reports. Keyspace notifications go out through this same path --
+    // they are ordinary messages, distinguished only by their channel names.
+    std::int64_t publishMessage(const std::string& channel, const std::string& payload);
+    // The shard namespace, which patterns deliberately do not reach.
+    std::int64_t publishShardMessage(const std::string& channel, const std::string& payload);
+
+    // Publishes the __keyspace@<db>__ and __keyevent@<db>__ pair for one event,
+    // when `event_class` and the K/E flags say to.
+    void notifyKeyspaceEvent(std::uint32_t event_class, std::string_view event,
+                             const std::string& key, int db_index);
+
     // Appends an out-of-band reply to another connection and asks the loop to
     // drain it. Command handlers write to their own client through ReplyWriter;
     // this is the only way bytes reach a client that did not ask for them.
@@ -199,6 +217,10 @@ private:
     std::int64_t                                    start_time_ms_  = 0;
     std::uint64_t                                   dirty_          = 0;
     PubSub                                          pubsub_;
+    // Frames a command owes its own connection. Redis answers a command before
+    // delivering any message it caused to the client that ran it, so these are
+    // held back until the handler's reply has been written.
+    std::string                                     self_pending_;
     Stats                                           stats_;
     std::string                                     run_id_;
     int                                             executing_fd_ = -1;

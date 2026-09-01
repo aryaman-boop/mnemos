@@ -35,6 +35,7 @@ std::vector<std::pair<std::string, std::string>> configEntries(const Server& ser
         {"databases",                   std::to_string(c.databases)},
         {"maxclients",                  std::to_string(c.max_clients)},
         {"requirepass",                 c.requirepass},
+        {"notify-keyspace-events",      notify::formatFlags(c.notify_flags)},
         {"proto-max-bulk-len",          "536870912"},
         {"timeout",                     "0"},
         {"tcp-keepalive",               "300"},
@@ -191,9 +192,26 @@ void config(CommandContext& ctx) {
             replies::wrongArgs(ctx.reply, "config|set");
             return;
         }
+        // Validation runs over every pair before anything is applied: Redis
+        // fails a CONFIG SET whole, so a bad value in the second pair must not
+        // leave the first one applied.
+        for (std::size_t i = 2; i + 1 < ctx.argc(); i += 2) {
+            if (core::toLower(ctx.arg(i)) != "notify-keyspace-events") continue;
+            std::uint32_t parsed = 0;
+            if (!notify::parseFlags(ctx.arg(i + 1), parsed)) {
+                ctx.reply.error("ERR CONFIG SET failed (possibly related to argument "
+                                "'notify-keyspace-events') - Invalid event class "
+                                "character. Use '" +
+                                std::string(notify::kClassChars) + "'.");
+                return;
+            }
+        }
+
         for (std::size_t i = 2; i + 1 < ctx.argc(); i += 2) {
             const std::string name = core::toLower(ctx.arg(i));
-            if (name == "requirepass") {
+            if (name == "notify-keyspace-events") {
+                notify::parseFlags(ctx.arg(i + 1), ctx.server.config().notify_flags);
+            } else if (name == "requirepass") {
                 ctx.server.config().requirepass = ctx.arg(i + 1);
             } else if (name == "dir") {
                 ctx.server.config().dir = ctx.arg(i + 1);

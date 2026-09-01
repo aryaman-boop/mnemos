@@ -7,6 +7,7 @@
 
 #include "core/strings.h"
 #include "server/commands/commands.h"
+#include "server/notify.h"
 #include "server/server.h"
 
 namespace mnemos::server::cmd {
@@ -147,6 +148,11 @@ void set(CommandContext& ctx) {
         if (existing) {
             old_value = existing->stringValue();
             had_old   = true;
+        } else {
+            // The GET option makes this a read as well as a write, and a read
+            // that found nothing is a key miss -- even when the write is then
+            // aborted by NX/XX.
+            notifyKeyMiss(ctx, key);
         }
     }
 
@@ -166,6 +172,10 @@ void set(CommandContext& ctx) {
     ctx.db.overwriteValue(key, Value::makeString(value));
     applyExpire(ctx, key, opts);
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kString, "set", key);
+    // SET with EX is two events, not one: the TTL is a separate fact about the
+    // key and subscribers watching only `g` still want to hear about it.
+    if (opts.set) notifyKeyspaceEvent(ctx, notify::kGeneric, "expire", key);
 
     if (get) {
         if (had_old) ctx.reply.bulk(old_value);
@@ -179,6 +189,7 @@ void get(CommandContext& ctx) {
     Value* v = ctx.db.lookupRead(ctx.arg(1), ctx.nowMs());
     if (!v) {
         ++ctx.server.stats().keyspace_misses;
+        notifyKeyMiss(ctx, ctx.arg(1));
         ctx.reply.nullBulk();
         return;
     }
@@ -191,23 +202,30 @@ void getset(CommandContext& ctx) {
     Value* existing = ctx.db.lookupWrite(ctx.arg(1), ctx.nowMs());
     if (!ensureString(ctx, existing)) return;
 
-    if (existing) ctx.reply.bulk(existing->stringValue());
-    else          ctx.reply.nullBulk();
+    if (existing) {
+        ctx.reply.bulk(existing->stringValue());
+    } else {
+        notifyKeyMiss(ctx, ctx.arg(1));
+        ctx.reply.nullBulk();
+    }
 
     ctx.db.setKey(ctx.arg(1), Value::makeString(ctx.arg(2)));
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kString, "set", ctx.arg(1));
 }
 
 void getdel(CommandContext& ctx) {
     Value* existing = ctx.db.lookupWrite(ctx.arg(1), ctx.nowMs());
     if (!ensureString(ctx, existing)) return;
     if (!existing) {
+        notifyKeyMiss(ctx, ctx.arg(1));
         ctx.reply.nullBulk();
         return;
     }
     ctx.reply.bulk(existing->stringValue());
     ctx.db.erase(ctx.arg(1));
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kGeneric, "del", ctx.arg(1));
 }
 
 void getex(CommandContext& ctx) {
@@ -241,6 +259,7 @@ void getex(CommandContext& ctx) {
 
     Value* v = ctx.db.lookupRead(key, ctx.nowMs());
     if (!v) {
+        notifyKeyMiss(ctx, key);
         ctx.reply.nullBulk();
         return;
     }
@@ -250,10 +269,22 @@ void getex(CommandContext& ctx) {
     // GETEX with no TTL option is a pure read and must not clear the TTL, which
     // is why this cannot just call applyExpire unconditionally.
     if (opts.set) {
-        ctx.db.setExpireAt(key, opts.at_ms);
-        ctx.server.markDirty();
+        if (opts.at_ms <= ctx.nowMs()) {
+            // An EXAT already in the past is a delete, and announces itself as
+            // one -- not as an expiry, which nothing here waited for.
+            ctx.db.erase(key);
+            ctx.server.markDirty();
+            notifyKeyspaceEvent(ctx, notify::kGeneric, "del", key);
+        } else {
+            ctx.db.setExpireAt(key, opts.at_ms);
+            ctx.server.markDirty();
+            notifyKeyspaceEvent(ctx, notify::kGeneric, "expire", key);
+        }
     } else if (opts.persist) {
-        if (ctx.db.persist(key)) ctx.server.markDirty();
+        if (ctx.db.persist(key)) {
+            ctx.server.markDirty();
+            notifyKeyspaceEvent(ctx, notify::kGeneric, "persist", key);
+        }
     }
 }
 
@@ -264,6 +295,7 @@ void setnx(CommandContext& ctx) {
     }
     ctx.db.setKey(ctx.arg(1), Value::makeString(ctx.arg(2)));
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kString, "set", ctx.arg(1));
     ctx.reply.integer(1);
 }
 
@@ -285,6 +317,8 @@ void setexGeneric(CommandContext& ctx, std::int64_t unit_multiplier, std::string
     ctx.db.setKey(ctx.arg(1), Value::makeString(ctx.arg(3)));
     ctx.db.setExpireAt(ctx.arg(1), ctx.nowMs() + ttl * unit_multiplier);
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kString, "set", ctx.arg(1));
+    notifyKeyspaceEvent(ctx, notify::kGeneric, "expire", ctx.arg(1));
     replies::ok(ctx.reply);
 }
 }  // namespace
@@ -299,6 +333,7 @@ void mset(CommandContext& ctx) {
     }
     for (std::size_t i = 1; i < ctx.argc(); i += 2) {
         ctx.db.setKey(ctx.arg(i), Value::makeString(ctx.arg(i + 1)));
+        notifyKeyspaceEvent(ctx, notify::kString, "set", ctx.arg(i));
     }
     ctx.server.markDirty((ctx.argc() - 1) / 2);
     replies::ok(ctx.reply);
@@ -318,6 +353,7 @@ void msetnx(CommandContext& ctx) {
     }
     for (std::size_t i = 1; i < ctx.argc(); i += 2) {
         ctx.db.setKey(ctx.arg(i), Value::makeString(ctx.arg(i + 1)));
+        notifyKeyspaceEvent(ctx, notify::kString, "set", ctx.arg(i));
     }
     ctx.server.markDirty((ctx.argc() - 1) / 2);
     ctx.reply.integer(1);
@@ -329,6 +365,7 @@ void mget(CommandContext& ctx) {
         Value* v = ctx.db.lookupRead(ctx.arg(i), ctx.nowMs());
         // A wrong-type key inside MGET yields a nil for that slot rather than
         // failing the whole command -- MGET is explicitly best-effort.
+        if (!v) notifyKeyMiss(ctx, ctx.arg(i));
         if (!v || !v->isString()) ctx.reply.nullBulk();
         else                      ctx.reply.bulk(v->stringValue());
     }
@@ -343,6 +380,7 @@ void append(CommandContext& ctx) {
         // leaving it embstr-encoded would force a re-encode on the next append.
         ctx.db.setKey(ctx.arg(1), Value::makeRawString(ctx.arg(2)));
         ctx.server.markDirty();
+        notifyKeyspaceEvent(ctx, notify::kString, "append", ctx.arg(1));
         ctx.reply.integer(static_cast<std::int64_t>(ctx.arg(2).size()));
         return;
     }
@@ -354,12 +392,14 @@ void append(CommandContext& ctx) {
 
     existing->appendString(ctx.arg(2));
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kString, "append", ctx.arg(1));
     ctx.reply.integer(static_cast<std::int64_t>(existing->stringLength()));
 }
 
 void strlen_(CommandContext& ctx) {
     Value* v = ctx.db.lookupRead(ctx.arg(1), ctx.nowMs());
     if (!v) {
+        notifyKeyMiss(ctx, ctx.arg(1));
         ctx.reply.integer(0);
         return;
     }
@@ -388,6 +428,7 @@ void incrDecrBy(CommandContext& ctx, std::int64_t delta) {
     const std::int64_t result = current + delta;
     ctx.db.overwriteValue(ctx.arg(1), Value::makeInt(result));
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kString, "incrby", ctx.arg(1));
     ctx.reply.integer(result);
 }
 }  // namespace
@@ -453,6 +494,7 @@ void incrbyfloat(CommandContext& ctx) {
     const std::string formatted = formatLongDouble(result);
     ctx.db.overwriteValue(ctx.arg(1), Value::makeString(formatted));
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kString, "incrbyfloat", ctx.arg(1));
     ctx.reply.bulk(formatted);
 }
 
@@ -494,6 +536,7 @@ void setrange(CommandContext& ctx) {
     std::copy(patch.begin(), patch.end(), data.begin() + offset);
 
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kString, "setrange", ctx.arg(1));
     ctx.reply.integer(static_cast<std::int64_t>(data.size()));
 }
 
@@ -507,6 +550,7 @@ void getrange(CommandContext& ctx) {
 
     Value* v = ctx.db.lookupRead(ctx.arg(1), ctx.nowMs());
     if (!v) {
+        notifyKeyMiss(ctx, ctx.arg(1));
         ctx.reply.bulk("");
         return;
     }

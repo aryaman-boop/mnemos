@@ -35,12 +35,13 @@ Value* Database::lookupWrite(std::string_view key, std::int64_t now_ms) {
 }
 
 void Database::setKey(std::string_view key, Value value) {
-    dict_.insert(key, std::move(value));
+    const bool added = dict_.insert(key, std::move(value));
     expires_.erase(key);
+    if (added && on_new_key_) on_new_key_(std::string(key));
 }
 
 void Database::overwriteValue(std::string_view key, Value value) {
-    dict_.insert(key, std::move(value));
+    if (dict_.insert(key, std::move(value)) && on_new_key_) on_new_key_(std::string(key));
 }
 
 bool Database::erase(std::string_view key) {

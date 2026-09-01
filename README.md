@@ -70,6 +70,8 @@ no third-party libraries for the server, the tests, or CI.
 --databases <n>       Number of keyspaces (default 16)
 --requirepass <pw>    Require AUTH before any command
 --maxclients <n>      Connection limit (default 10000)
+--notify-keyspace-events <flags>
+                      Keyspace notification classes (default off)
 ```
 
 ## Features
@@ -96,10 +98,14 @@ no third-party libraries for the server, the tests, or CI.
   (`SSUBSCRIBE`/`SPUBLISH`), with messages framed as plain arrays for RESP2
   subscribers and as push frames for RESP3 ones, and the RESP2
   subscriber-mode command restriction that goes with it.
+- **Keyspace notifications** — `notify-keyspace-events` with the whole class
+  bitmask, publishing to `__keyspace@<db>__:<key>` and `__keyevent@<db>__:<event>`.
+  The event names, the order two of them arrive in, which commands stay silent,
+  and the way `CONFIG GET` normalises the flag string are all matched against
+  Redis rather than approximated.
 
 ### Not there yet
 
-- [ ] Keyspace notifications
 - [ ] `MULTI` / `EXEC` / `WATCH`
 - [ ] RDB persistence — in the real format, so files are portable
 - [ ] AOF with rewrite
@@ -148,7 +154,7 @@ edge cases nobody thinks to write a test for — negative `LREM` counts,
 `ZADD GT/LT`, exclusive score ranges, `WRONGTYPE` on every command, and the
 rule that a collection is deleted once its last element is removed. Pub/sub is
 covered the same way, over two connections per server, so a delivered message
-has to arrive on the right one with the right framing. All 34 suites match byte
+has to arrive on the right one with the right framing. All 46 suites match byte
 for byte against Redis 8.10.1; a suite that depends on behaviour newer than the
 reference server is skipped and counted, never quietly passed.
 

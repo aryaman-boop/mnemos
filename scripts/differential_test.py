@@ -118,6 +118,7 @@ def normalise(reply, unordered=False):
 #                command is then prefixed with the connection index, and two
 #                pseudo-commands are available:
 #                  (i, "@recv")   read one unsolicited frame on connection i
+#                  (i, "@sleep", secs)  wait, for events raised by a timer
 #                  (i, "@hello3") switch connection i to RESP3, ignoring the
 #                                 reply, whose contents are server-specific
 SUITES = [
@@ -423,6 +424,274 @@ SUITES = [
         ("PUBSUB", "SHARDCHANNELS", "a", "b"),
         ("PUBSUB", "SHARDNUMPAT"),
     ], {"min_redis": (7, 0)}),
+    # Keyspace notifications. The subscriber is connection 1 throughout: it is
+    # still RESP2, so subscriber mode confines it to @recv, which is all it has
+    # to do. Connection 0 has been switched to RESP3 by the suites above and can
+    # go on issuing ordinary commands.
+    #
+    # Every suite enables exactly the classes it is about and resets the config
+    # afterwards, so a step that is meant to be silent really is: the next
+    # @recv would otherwise read its stray frame and the mismatch would show up
+    # somewhere unhelpful.
+    ("keyspace: notify-keyspace-events normalises", [
+        ("CONFIG", "SET", "notify-keyspace-events", "A"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "KEA"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        # "A" swallows "n" on the way out even though it does not imply it.
+        ("CONFIG", "SET", "notify-keyspace-events", "KEAn"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "KEAnm"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "EA"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "gxE"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "K"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "g$lshzxet"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "g$lshzxetdn"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        # Spelling out every class in the alias collapses back to "A".
+        ("CONFIG", "SET", "notify-keyspace-events", "g$lshzxetdnocaSTIV"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "Ao"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "ca"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "cao"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "VITS"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "Va"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "Sn"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "xoS"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "IVc"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "md"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", "KEm"),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        ("CONFIG", "SET", "notify-keyspace-events", ""),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+        # An unknown class leaves the setting untouched, and says which one.
+        ("CONFIG", "SET", "notify-keyspace-events", "Q"),
+        ("CONFIG", "SET", "notify-keyspace-events", "-"),
+        ("CONFIG", "SET", "notify-keyspace-events", "k"),
+        ("CONFIG", "SET", "notify-keyspace-events", "G"),
+        ("CONFIG", "SET", "notify-keyspace-events", "KE "),
+        ("CONFIG", "GET", "notify-keyspace-events"),
+    ], {"min_redis": (8, 0)}),
+    ("keyspace: string events", [
+        (0, "DEL", "ks", "kn", "ke", "km1", "km2", "kz"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", "KE$g"),
+        (1, "PSUBSCRIBE", "__keyevent@0__:*"),
+        (0, "SET", "ks", "v"), (1, "@recv"),
+        (0, "SET", "ks", "v2", "EX", "100"), (1, "@recv"), (1, "@recv"),
+        (0, "APPEND", "ks", "x"), (1, "@recv"),
+        (0, "SETRANGE", "ks", "1", "zz"), (1, "@recv"),
+        (0, "GETRANGE", "ks", "0", "-1"),          # reads say nothing
+        (0, "SET", "kn", "5"), (1, "@recv"),
+        (0, "INCR", "kn"), (1, "@recv"),           # ... and it is called incrby
+        (0, "INCRBYFLOAT", "kn", "1.5"), (1, "@recv"),
+        (0, "GETDEL", "kn"), (1, "@recv"),
+        (0, "SETEX", "ke", "100", "v"), (1, "@recv"), (1, "@recv"),
+        (0, "SETNX", "ke", "v"),                   # refused: no event
+        (0, "GETEX", "ke", "PERSIST"), (1, "@recv"),
+        (0, "GETEX", "ke"),                        # no TTL option, nothing to say
+        (0, "MSET", "km1", "a", "km2", "b"), (1, "@recv"), (1, "@recv"),
+        (0, "DEL", "km1", "km2"), (1, "@recv"), (1, "@recv"),
+        (0, "SET", "ks", "x", "XX", "KEEPTTL"), (1, "@recv"),
+        (0, "SET", "kz", "v", "XX"),               # XX on a missing key: silent
+        (0, "GETSET", "ks", "g"), (1, "@recv"),
+        (0, "SET", "ks", "q", "GET"), (1, "@recv"),
+        (0, "DEL", "ks", "ke"), (1, "@recv"), (1, "@recv"),
+        (1, "PUNSUBSCRIBE"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", ""),
+    ], {"two_clients": True}),
+    ("keyspace: generic and expiry events", [
+        (0, "DEL", "kg1", "kg2", "kg3", "kg4"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", "KE$g"),
+        (1, "PSUBSCRIBE", "__keyevent@0__:*"),
+        (0, "SET", "kg1", "v"), (1, "@recv"),
+        (0, "RENAME", "kg1", "kg2"), (1, "@recv"), (1, "@recv"),
+        (0, "COPY", "kg2", "kg3"), (1, "@recv"),
+        (0, "EXPIRE", "kg2", "100"), (1, "@recv"),
+        (0, "PERSIST", "kg2"), (1, "@recv"),
+        (0, "PERSIST", "kg2"),                     # no TTL left to remove
+        (0, "EXPIRE", "kg2", "0"), (1, "@recv"),   # a deadline in the past is a del
+        (0, "SET", "kg2", "v"), (1, "@recv"),
+        (0, "EXPIRE", "kg2", "100", "XX"),         # no TTL: XX declines
+        (0, "EXPIRE", "kg2", "100", "NX"), (1, "@recv"),
+        (0, "EXPIRE", "kg2", "50", "GT"),          # lower: GT declines
+        (0, "PEXPIREAT", "kg2", "1"), (1, "@recv"),
+        (0, "UNLINK", "kg3"), (1, "@recv"),
+        (0, "DEL", "kg.absent"),
+        (0, "SET", "kg1", "v"), (1, "@recv"),
+        (0, "RENAMENX", "kg1", "kg4"), (1, "@recv"), (1, "@recv"),
+        (0, "DEL", "kg4"), (1, "@recv"),
+        (1, "PUNSUBSCRIBE"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", ""),
+    ], {"two_clients": True}),
+    ("keyspace: new-key events", [
+        (0, "DEL", "kn1", "kn2", "kn3"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", "KEAn"),
+        (1, "PSUBSCRIBE", "__keyevent@0__:*"),
+        (0, "SET", "kn1", "v"), (1, "@recv"), (1, "@recv"),   # new, then set
+        (0, "SET", "kn1", "w"), (1, "@recv"),                 # no longer new
+        (0, "RPUSH", "kn2", "a"), (1, "@recv"), (1, "@recv"),
+        (0, "DEL", "kn1", "kn2"), (1, "@recv"), (1, "@recv"),
+        (0, "SETNX", "kn1", "v"), (1, "@recv"), (1, "@recv"),
+        (0, "INCR", "kn3"), (1, "@recv"), (1, "@recv"),
+        (0, "DEL", "kn1", "kn3"), (1, "@recv"), (1, "@recv"),
+        # "A" on its own does not imply "n", however it prints.
+        (0, "CONFIG", "SET", "notify-keyspace-events", "KEA"),
+        (0, "SET", "kn1", "v"), (1, "@recv"),
+        (0, "DEL", "kn1"), (1, "@recv"),
+        (1, "PUNSUBSCRIBE"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", ""),
+    ], {"two_clients": True, "min_redis": (7, 0)}),
+    ("keyspace: list events", [
+        (0, "DEL", "kl", "kl2"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", "KEgl"),
+        (1, "PSUBSCRIBE", "__keyevent@0__:*"),
+        (0, "RPUSH", "kl", "a", "b", "c"), (1, "@recv"),
+        (0, "LPUSH", "kl", "z"), (1, "@recv"),
+        (0, "LPUSHX", "kl.absent", "x"),
+        (0, "LSET", "kl", "0", "y"), (1, "@recv"),
+        (0, "LREM", "kl", "0", "y"), (1, "@recv"),
+        (0, "LTRIM", "kl", "0", "-1"), (1, "@recv"),   # a no-op still announces
+        (0, "LTRIM", "kl", "0", "0"), (1, "@recv"),
+        # The destination is announced before the source it came from.
+        (0, "RPOPLPUSH", "kl", "kl2"), (1, "@recv"), (1, "@recv"), (1, "@recv"),
+        (0, "LMOVE", "kl2", "kl2", "LEFT", "RIGHT"), (1, "@recv"), (1, "@recv"),
+        (0, "LPOP", "kl2"), (1, "@recv"), (1, "@recv"),
+        (0, "RPUSH", "kl2", "a", "b"), (1, "@recv"),
+        (0, "RPOP", "kl2", "2"), (1, "@recv"), (1, "@recv"),
+        (1, "PUNSUBSCRIBE"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", ""),
+    ], {"two_clients": True}),
+    ("keyspace: hash events", [
+        (0, "DEL", "kh"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", "KEgh"),
+        (1, "PSUBSCRIBE", "__keyevent@0__:*"),
+        (0, "HSET", "kh", "f", "v", "g", "w"), (1, "@recv"),
+        (0, "HSETNX", "kh", "f", "x"),                 # field exists: silent
+        (0, "HSETNX", "kh", "k", "x"), (1, "@recv"),   # ... and it is an hset
+        (0, "HINCRBY", "kh", "n", "2"), (1, "@recv"),
+        (0, "HINCRBYFLOAT", "kh", "n", "1.5"), (1, "@recv"),
+        (0, "HDEL", "kh", "f", "g"), (1, "@recv"),
+        (0, "HDEL", "kh", "n", "k"), (1, "@recv"), (1, "@recv"),
+        (0, "HDEL", "kh", "nope"),
+        (1, "PUNSUBSCRIBE"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", ""),
+    ], {"two_clients": True}),
+    ("keyspace: set events", [
+        (0, "DEL", "kS1", "kS2", "kS3"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", "KEgs"),
+        (1, "PSUBSCRIBE", "__keyevent@0__:*"),
+        (0, "SADD", "kS1", "a", "b", "c"), (1, "@recv"),
+        (0, "SADD", "kS1", "a"),                       # already a member
+        (0, "SREM", "kS1", "a"), (1, "@recv"),
+        (0, "SMOVE", "kS1", "kS2", "b"), (1, "@recv"), (1, "@recv"),
+        (0, "SADD", "kS3", "x"), (1, "@recv"),
+        # An empty result deletes the destination, and says only that.
+        (0, "SINTERSTORE", "kS3", "kS1", "kS2"), (1, "@recv"),
+        (0, "SADD", "kS1", "b"), (1, "@recv"),
+        (0, "SUNIONSTORE", "kS3", "kS1", "kS2"), (1, "@recv"),
+        (0, "SDIFFSTORE", "kS3", "kS1", "kS1"), (1, "@recv"),
+        (0, "SPOP", "kS2"), (1, "@recv"), (1, "@recv"),
+        (0, "DEL", "kS1"), (1, "@recv"),
+        (1, "PUNSUBSCRIBE"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", ""),
+    ], {"two_clients": True}),
+    ("keyspace: zset events", [
+        (0, "DEL", "kZ"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", "KEgz"),
+        (1, "PSUBSCRIBE", "__keyevent@0__:*"),
+        (0, "ZADD", "kZ", "1", "a", "2", "b"), (1, "@recv"),
+        (0, "ZADD", "kZ", "1", "a"),                   # same score: nothing moved
+        (0, "ZADD", "kZ", "NX", "5", "a"),             # NX on a member: declined
+        (0, "ZADD", "kZ", "XX", "GT", "CH", "5", "a"), (1, "@recv"),
+        (0, "ZINCRBY", "kZ", "1", "a"), (1, "@recv"),  # zincr, not zadd
+        (0, "ZADD", "kZ", "INCR", "1", "b"), (1, "@recv"),
+        (0, "ZREM", "kZ", "a"), (1, "@recv"),
+        (0, "ZREMRANGEBYSCORE", "kZ", "100", "200"),   # removed nothing
+        (0, "ZREMRANGEBYRANK", "kZ", "0", "-1"), (1, "@recv"), (1, "@recv"),
+        (0, "ZADD", "kZ", "1", "a"), (1, "@recv"),
+        (0, "ZPOPMIN", "kZ"), (1, "@recv"), (1, "@recv"),
+        (0, "ZADD", "kZ", "1", "a", "2", "b"), (1, "@recv"),
+        (0, "ZPOPMAX", "kZ", "2"), (1, "@recv"), (1, "@recv"),
+        (1, "PUNSUBSCRIBE"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", ""),
+    ], {"two_clients": True}),
+    ("keyspace: both channels, and the db in their names", [
+        (0, "DEL", "ko"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", "KEA"),
+        (1, "PSUBSCRIBE", "__key*@0__:*"),
+        # The keyspace notification comes first, then the keyevent one.
+        (0, "SET", "ko", "v"), (1, "@recv"), (1, "@recv"),
+        (0, "DEL", "ko"), (1, "@recv"), (1, "@recv"),
+        (1, "PUNSUBSCRIBE"),
+        (1, "PSUBSCRIBE", "__key*@1__:*"),
+        (0, "SELECT", "1"),
+        (0, "DEL", "ko"),
+        (0, "SET", "ko", "v"), (1, "@recv"), (1, "@recv"),
+        (0, "DEL", "ko"), (1, "@recv"), (1, "@recv"),
+        (0, "SELECT", "0"),
+        (1, "PUNSUBSCRIBE"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", ""),
+    ], {"two_clients": True}),
+    ("keyspace: key misses", [
+        (0, "DEL", "kM"),
+        # "m" is outside "A": key misses are noisy, so they stay opt-in.
+        (0, "CONFIG", "SET", "notify-keyspace-events", "KEm"),
+        (1, "PSUBSCRIBE", "__keyevent@0__:*"),
+        (0, "GET", "kM"), (1, "@recv"),
+        (0, "MGET", "kM", "kM"), (1, "@recv"), (1, "@recv"),
+        (0, "STRLEN", "kM"), (1, "@recv"),
+        (0, "EXISTS", "kM"), (1, "@recv"),
+        (0, "TYPE", "kM"), (1, "@recv"),
+        (0, "TTL", "kM"), (1, "@recv"),
+        (0, "TOUCH", "kM"), (1, "@recv"),
+        (0, "LLEN", "kM"), (1, "@recv"),
+        (0, "HLEN", "kM"), (1, "@recv"),
+        (0, "SCARD", "kM"), (1, "@recv"),
+        (0, "ZCARD", "kM"), (1, "@recv"),
+        (0, "SET", "kM", "v"),                     # writes never miss
+        (0, "GET", "kM"),                          # ... and neither does a hit
+        (0, "DEL", "kM"),                          # nor DEL, which Redis exempts
+        (0, "COPY", "kM", "kM2"), (1, "@recv"),
+        (1, "PUNSUBSCRIBE"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", ""),
+    ], {"two_clients": True}),
+    ("keyspace: expired", [
+        (0, "DEL", "kx"),
+        # Only "x": the set and its TTL would otherwise speak first.
+        (0, "CONFIG", "SET", "notify-keyspace-events", "KEx"),
+        (1, "PSUBSCRIBE", "__keyevent@0__:*"),
+        (0, "SET", "kx", "v", "PX", "60"),
+        (0, "@sleep", "0.5"),
+        (1, "@recv"),
+        (0, "EXISTS", "kx"),
+        (1, "PUNSUBSCRIBE"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", ""),
+    ], {"two_clients": True}),
+    ("keyspace: the client that caused the event is told too", [
+        ("@hello3",),
+        ("DEL", "kself"),
+        ("CONFIG", "SET", "notify-keyspace-events", "KEA"),
+        ("SUBSCRIBE", "__keyevent@0__:set"),
+        ("SET", "kself", "v"),        # the reply comes first ...
+        ("@recv",),                   # ... and the push it caused after it
+        ("UNSUBSCRIBE", "__keyevent@0__:set"),
+        ("DEL", "kself"),
+        ("CONFIG", "SET", "notify-keyspace-events", ""),
+    ], {}),
     ("wrongtype errors", [
         ("DEL", "w"), ("SET", "w", "string"),
         ("LPUSH", "w", "x"), ("HSET", "w", "f", "v"), ("SADD", "w", "m"),
@@ -467,6 +736,11 @@ def issue(client, args):
     if args[0] == "@hello3":
         client.cmd("HELLO", "3")
         return ("status", "hello3")
+    if args[0] == "@sleep":
+        # Only the expiry suites need this: `expired` is raised by a background
+        # cycle, so there is nothing to send that would provoke it.
+        time.sleep(float(args[1]))
+        return ("status", "slept")
     return client.cmd(*args)
 
 

@@ -45,6 +45,13 @@ public:
         on_expired_ = std::move(cb);
     }
 
+    // Called when a key that was not there before is added, whatever put it
+    // there. Redis reports this as the `new` event, and it always precedes the
+    // event for the command that did the creating.
+    void setNewKeyCallback(std::function<void(const std::string&)> cb) {
+        on_new_key_ = std::move(cb);
+    }
+
     // When false (i.e. we are a replica of someone else), a logically-expired
     // key reads as missing but is *not* deleted -- we wait for the master's DEL.
     void setExpirationEnabled(bool enabled) { expiration_enabled_ = enabled; }
@@ -99,6 +106,7 @@ private:
     core::Dict<Value>                       dict_;
     core::Dict<std::int64_t>                expires_;
     std::function<void(const std::string&)> on_expired_;
+    std::function<void(const std::string&)> on_new_key_;
     bool                                    expiration_enabled_ = true;
 };
 

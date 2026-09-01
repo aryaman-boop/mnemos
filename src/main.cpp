@@ -35,6 +35,8 @@ void printUsage() {
         "  --dir <path>          Working directory for persistence\n"
         "  --dbfilename <name>   RDB filename (default dump.rdb)\n"
         "  --maxclients <n>      Connection limit (default 10000)\n"
+        "  --notify-keyspace-events <flags>\n"
+        "                        Keyspace notification classes (e.g. KEA)\n"
         "  --help                Show this message\n");
 }
 
@@ -90,6 +92,12 @@ int main(int argc, char** argv) {
         } else if (arg == "--maxclients") {
             if (!takeValue(argc, argv, i, "--maxclients", value)) return 1;
             config.max_clients = static_cast<std::size_t>(std::atol(value.c_str()));
+        } else if (arg == "--notify-keyspace-events") {
+            if (!takeValue(argc, argv, i, "--notify-keyspace-events", value)) return 1;
+            if (!mnemos::server::notify::parseFlags(value, config.notify_flags)) {
+                std::fprintf(stderr, "mnemos: invalid event class in '%s'\n", value.c_str());
+                return 1;
+            }
         } else {
             std::fprintf(stderr, "mnemos: unknown option '%s'\n", argv[i]);
             printUsage();

@@ -6,6 +6,7 @@
 #include "core/strings.h"
 #include "server/commands/commands.h"
 #include "server/commands/type_helpers.h"
+#include "server/notify.h"
 #include "server/server.h"
 
 namespace mnemos::server::cmd {
@@ -25,7 +26,7 @@ bool gatherSets(CommandContext& ctx, std::size_t first, std::size_t last,
                 std::vector<std::vector<std::string>>& out) {
     for (std::size_t i = first; i <= last && i < ctx.argc(); ++i) {
         bool type_error = false;
-        Value* value = lookupTyped(ctx, ctx.arg(i), ObjType::Set, type_error);
+        Value* value = lookupTypedRead(ctx, ctx.arg(i), ObjType::Set, type_error);
         if (type_error) return false;
         out.push_back(value ? value->set()->members() : std::vector<std::string>{});
     }
@@ -92,6 +93,17 @@ std::vector<std::string> applySetOp(SetOp op, std::vector<std::vector<std::strin
     return result;
 }
 
+// The STORE variants name their event after themselves, not after the
+// operation: a subscriber sees "sinterstore", not "sadd".
+std::string_view storeEventName(SetOp op) {
+    switch (op) {
+        case SetOp::Intersect:  return "sinterstore";
+        case SetOp::Union:      return "sunionstore";
+        case SetOp::Difference: return "sdiffstore";
+    }
+    return "";
+}
+
 void setOpCommand(CommandContext& ctx, SetOp op, bool store) {
     const std::size_t first_key = store ? 2 : 1;
     std::vector<std::vector<std::string>> sets;
@@ -105,13 +117,17 @@ void setOpCommand(CommandContext& ctx, SetOp op, bool store) {
         return;
     }
 
-    // The destination is replaced wholesale, and an empty result deletes it.
-    ctx.db.erase(ctx.arg(1));
+    const std::string& dst = ctx.arg(1);
     if (!result.empty()) {
-        bool type_error = false;
-        Value* destination = lookupOrCreate(ctx, ctx.arg(1), ObjType::Set, type_error);
-        if (type_error || !destination) return;
+        // setKey rather than erase-then-create: it drops the old TTL the same
+        // way, but only announces `new` when the destination really is new.
+        ctx.db.setKey(dst, Value::makeSet());
+        Value* destination = ctx.db.lookupWrite(dst, ctx.nowMs());
         for (const std::string& member : result) destination->set()->add(member);
+        notifyKeyspaceEvent(ctx, notify::kSet, storeEventName(op), dst);
+    } else if (ctx.db.erase(dst)) {
+        // An empty result is a delete, and that is the only event it raises.
+        notifyKeyspaceEvent(ctx, notify::kGeneric, "del", dst);
     }
     ctx.server.markDirty();
     ctx.reply.integer(static_cast<std::int64_t>(result.size()));
@@ -128,7 +144,10 @@ void sadd(CommandContext& ctx) {
     for (std::size_t i = 2; i < ctx.argc(); ++i) {
         if (value->set()->add(ctx.arg(i))) ++added;
     }
-    if (added > 0) ctx.server.markDirty(static_cast<std::uint64_t>(added));
+    if (added > 0) {
+        ctx.server.markDirty(static_cast<std::uint64_t>(added));
+        notifyKeyspaceEvent(ctx, notify::kSet, "sadd", ctx.arg(1));
+    }
     ctx.reply.integer(added);
 }
 
@@ -144,28 +163,31 @@ void srem(CommandContext& ctx) {
     for (std::size_t i = 2; i < ctx.argc(); ++i) {
         if (value->set()->erase(ctx.arg(i))) ++removed;
     }
-    if (removed > 0) ctx.server.markDirty(static_cast<std::uint64_t>(removed));
+    if (removed > 0) {
+        ctx.server.markDirty(static_cast<std::uint64_t>(removed));
+        notifyKeyspaceEvent(ctx, notify::kSet, "srem", ctx.arg(1));
+    }
     deleteIfEmpty(ctx, ctx.arg(1), *value);
     ctx.reply.integer(removed);
 }
 
 void scard(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::Set, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::Set, type_error);
     if (type_error) return;
     ctx.reply.integer(value ? static_cast<std::int64_t>(value->set()->size()) : 0);
 }
 
 void sismember(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::Set, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::Set, type_error);
     if (type_error) return;
     ctx.reply.integer(value && value->set()->contains(ctx.arg(2)) ? 1 : 0);
 }
 
 void smismember(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::Set, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::Set, type_error);
     if (type_error) return;
 
     ctx.reply.arrayHeader(static_cast<std::int64_t>(ctx.argc() - 2));
@@ -176,7 +198,7 @@ void smismember(CommandContext& ctx) {
 
 void smembers(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::Set, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::Set, type_error);
     if (type_error) return;
     if (!value) {
         ctx.reply.setHeader(0);
@@ -215,7 +237,10 @@ void spop(CommandContext& ctx) {
         popped.push_back(std::move(*member));
     }
 
-    if (!popped.empty()) ctx.server.markDirty(popped.size());
+    if (!popped.empty()) {
+        ctx.server.markDirty(popped.size());
+        notifyKeyspaceEvent(ctx, notify::kSet, "spop", ctx.arg(1));
+    }
     deleteIfEmpty(ctx, ctx.arg(1), *value);
 
     if (has_count) {
@@ -228,7 +253,7 @@ void spop(CommandContext& ctx) {
 
 void srandmember(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::Set, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::Set, type_error);
     if (type_error) return;
 
     bool         has_count = ctx.argc() > 2;
@@ -280,11 +305,13 @@ void smove(CommandContext& ctx) {
         return;
     }
     source->set()->erase(ctx.arg(3));
+    notifyKeyspaceEvent(ctx, notify::kSet, "srem", ctx.arg(1));
     deleteIfEmpty(ctx, ctx.arg(1), *source);
 
     Value* target = lookupOrCreate(ctx, ctx.arg(2), ObjType::Set, type_error);
     if (type_error || !target) return;
     target->set()->add(ctx.arg(3));
+    notifyKeyspaceEvent(ctx, notify::kSet, "sadd", ctx.arg(2));
 
     ctx.server.markDirty();
     ctx.reply.integer(1);

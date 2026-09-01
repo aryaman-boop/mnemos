@@ -7,6 +7,7 @@
 #include "core/strings.h"
 #include "server/commands/commands.h"
 #include "server/commands/type_helpers.h"
+#include "server/notify.h"
 #include "server/server.h"
 
 namespace mnemos::server::cmd {
@@ -82,7 +83,7 @@ bool resolveIndexRange(std::int64_t& start, std::int64_t& stop, std::int64_t len
 
 void rankGeneric(CommandContext& ctx, bool reverse) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::ZSet, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::ZSet, type_error);
     if (type_error) return;
     if (!value) {
         ctx.reply.nullBulk();
@@ -104,8 +105,9 @@ void popGeneric(CommandContext& ctx, bool lowest) {
     Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::ZSet, type_error);
     if (type_error) return;
 
+    const bool has_count = ctx.argc() > 2;
     std::int64_t count = 1;
-    if (ctx.argc() > 2 && (!stringToInt64(ctx.arg(2), count) || count < 0)) {
+    if (has_count && (!stringToInt64(ctx.arg(2), count) || count < 0)) {
         ctx.reply.error("ERR value is out of range, must be positive");
         return;
     }
@@ -121,9 +123,22 @@ void popGeneric(CommandContext& ctx, bool lowest) {
     std::vector<std::pair<std::string, double>> popped(all.begin(),
                                                        all.begin() + static_cast<std::ptrdiff_t>(wanted));
     for (const auto& [member, score] : popped) value->zset()->erase(member);
-    if (!popped.empty()) ctx.server.markDirty(popped.size());
+    if (!popped.empty()) {
+        ctx.server.markDirty(popped.size());
+        notifyKeyspaceEvent(ctx, notify::kZset, lowest ? "zpopmin" : "zpopmax", ctx.arg(1));
+    }
     deleteIfEmpty(ctx, ctx.arg(1), *value);
 
+    // Without a count RESP3 sends the pair flat; only the counted form wraps
+    // each pair in an array of its own.
+    if (!has_count && ctx.reply.protocolVersion() >= 3) {
+        ctx.reply.arrayHeader(static_cast<std::int64_t>(popped.size() * 2));
+        for (const auto& [member, score] : popped) {
+            ctx.reply.bulk(member);
+            ctx.reply.doubleValue(score);
+        }
+        return;
+    }
     emitMembers(ctx, popped, true);
 }
 
@@ -217,12 +232,17 @@ void zadd(CommandContext& ctx) {
 
         if (incr) {
             ctx.server.markDirty();
+            // The INCR form announces itself as ZINCRBY does, not as a ZADD.
+            notifyKeyspaceEvent(ctx, notify::kZset, "zincr", ctx.arg(1));
             ctx.reply.doubleValue(final_score);
             return;
         }
     }
 
     ctx.server.markDirty(updates.size());
+    // Silent when every update was filtered out by NX/XX/GT/LT: Redis raises the
+    // event only for a set that actually moved.
+    if (added + changed > 0) notifyKeyspaceEvent(ctx, notify::kZset, "zadd", ctx.arg(1));
     deleteIfEmpty(ctx, ctx.arg(1), *value);
     // CH reports added *plus* changed rather than added alone.
     ctx.reply.integer(ch ? added + changed : added);
@@ -240,14 +260,17 @@ void zrem(CommandContext& ctx) {
     for (std::size_t i = 2; i < ctx.argc(); ++i) {
         if (value->zset()->erase(ctx.arg(i))) ++removed;
     }
-    if (removed > 0) ctx.server.markDirty(static_cast<std::uint64_t>(removed));
+    if (removed > 0) {
+        ctx.server.markDirty(static_cast<std::uint64_t>(removed));
+        notifyKeyspaceEvent(ctx, notify::kZset, "zrem", ctx.arg(1));
+    }
     deleteIfEmpty(ctx, ctx.arg(1), *value);
     ctx.reply.integer(removed);
 }
 
 void zscore(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::ZSet, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::ZSet, type_error);
     if (type_error) return;
     if (!value) {
         ctx.reply.nullBulk();
@@ -260,7 +283,7 @@ void zscore(CommandContext& ctx) {
 
 void zmscore(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::ZSet, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::ZSet, type_error);
     if (type_error) return;
 
     ctx.reply.arrayHeader(static_cast<std::int64_t>(ctx.argc() - 2));
@@ -273,7 +296,7 @@ void zmscore(CommandContext& ctx) {
 
 void zcard(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::ZSet, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::ZSet, type_error);
     if (type_error) return;
     ctx.reply.integer(value ? static_cast<std::int64_t>(value->zset()->size()) : 0);
 }
@@ -297,6 +320,7 @@ void zincrby(CommandContext& ctx) {
     }
     value->zset()->add(ctx.arg(3), result);
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kZset, "zincr", ctx.arg(1));
     ctx.reply.doubleValue(result);
 }
 
@@ -320,7 +344,7 @@ void rangeByIndex(CommandContext& ctx, bool reverse) {
     }
 
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::ZSet, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::ZSet, type_error);
     if (type_error) return;
     if (!value) {
         ctx.reply.arrayHeader(0);
@@ -370,7 +394,7 @@ void rangeByScore(CommandContext& ctx, bool reverse) {
     }
 
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::ZSet, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::ZSet, type_error);
     if (type_error) return;
     if (!value) {
         ctx.reply.arrayHeader(0);
@@ -408,7 +432,7 @@ void zcount(CommandContext& ctx) {
         return;
     }
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::ZSet, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::ZSet, type_error);
     if (type_error) return;
     ctx.reply.integer(value ? static_cast<std::int64_t>(value->zset()->rangeByScore(range).size())
                             : 0);
@@ -437,7 +461,10 @@ void zremrangebyrank(CommandContext& ctx) {
     for (std::int64_t i = start; i <= stop; ++i) {
         if (value->zset()->erase(all[static_cast<std::size_t>(i)].first)) ++removed;
     }
-    if (removed > 0) ctx.server.markDirty(static_cast<std::uint64_t>(removed));
+    if (removed > 0) {
+        ctx.server.markDirty(static_cast<std::uint64_t>(removed));
+        notifyKeyspaceEvent(ctx, notify::kZset, "zremrangebyrank", ctx.arg(1));
+    }
     deleteIfEmpty(ctx, ctx.arg(1), *value);
     ctx.reply.integer(removed);
 }
@@ -460,7 +487,10 @@ void zremrangebyscore(CommandContext& ctx) {
     for (const auto& [member, score] : value->zset()->rangeByScore(range)) {
         if (value->zset()->erase(member)) ++removed;
     }
-    if (removed > 0) ctx.server.markDirty(static_cast<std::uint64_t>(removed));
+    if (removed > 0) {
+        ctx.server.markDirty(static_cast<std::uint64_t>(removed));
+        notifyKeyspaceEvent(ctx, notify::kZset, "zremrangebyscore", ctx.arg(1));
+    }
     deleteIfEmpty(ctx, ctx.arg(1), *value);
     ctx.reply.integer(removed);
 }
@@ -470,7 +500,7 @@ void zpopmax(CommandContext& ctx) { popGeneric(ctx, false); }
 
 void zrandmember(CommandContext& ctx) {
     bool type_error = false;
-    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::ZSet, type_error);
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::ZSet, type_error);
     if (type_error) return;
 
     bool         has_count   = ctx.argc() > 2;

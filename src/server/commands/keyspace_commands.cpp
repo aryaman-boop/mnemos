@@ -3,6 +3,7 @@
 
 #include "core/strings.h"
 #include "server/commands/commands.h"
+#include "server/notify.h"
 #include "server/server.h"
 
 namespace mnemos::server::cmd {
@@ -27,7 +28,10 @@ void del(CommandContext& ctx) {
     for (std::size_t i = 1; i < ctx.argc(); ++i) {
         // lookupRead first so an already-expired key is not counted as deleted.
         if (!ctx.db.lookupRead(ctx.arg(i), ctx.nowMs())) continue;
-        if (ctx.db.erase(ctx.arg(i))) ++removed;
+        if (ctx.db.erase(ctx.arg(i))) {
+            ++removed;
+            notifyKeyspaceEvent(ctx, notify::kGeneric, "del", ctx.arg(i));
+        }
     }
     if (removed > 0) ctx.server.markDirty(static_cast<std::uint64_t>(removed));
     ctx.reply.integer(removed);
@@ -43,12 +47,14 @@ void exists(CommandContext& ctx) {
     // Repeated keys are counted repeatedly: EXISTS k k returns 2.
     for (std::size_t i = 1; i < ctx.argc(); ++i) {
         if (ctx.db.exists(ctx.arg(i), ctx.nowMs())) ++count;
+        else                                        notifyKeyMiss(ctx, ctx.arg(i));
     }
     ctx.reply.integer(count);
 }
 
 void type(CommandContext& ctx) {
     Value* v = ctx.db.lookupRead(ctx.arg(1), ctx.nowMs());
+    if (!v) notifyKeyMiss(ctx, ctx.arg(1));
     ctx.reply.simpleString(v ? core::typeName(v->type()) : std::string_view("none"));
 }
 
@@ -56,6 +62,7 @@ void touch(CommandContext& ctx) {
     std::int64_t count = 0;
     for (std::size_t i = 1; i < ctx.argc(); ++i) {
         if (ctx.db.lookupRead(ctx.arg(i), ctx.nowMs())) ++count;
+        else                                            notifyKeyMiss(ctx, ctx.arg(i));
     }
     ctx.reply.integer(count);
 }
@@ -173,6 +180,10 @@ void renameGeneric(CommandContext& ctx, bool fail_if_exists) {
     if (expire_at >= 0) ctx.db.setExpireAt(dst, expire_at);
 
     ctx.server.markDirty();
+    // Two events for one command, in the order a subscriber can act on: the key
+    // that went away, then the key that appeared.
+    notifyKeyspaceEvent(ctx, notify::kGeneric, "rename_from", src);
+    notifyKeyspaceEvent(ctx, notify::kGeneric, "rename_to", dst);
     if (fail_if_exists) ctx.reply.integer(1);
     else                replies::ok(ctx.reply);
 }
@@ -213,6 +224,7 @@ void copy(CommandContext& ctx) {
 
     Value* source = ctx.db.lookupRead(src, ctx.nowMs());
     if (!source) {
+        notifyKeyMiss(ctx, src);
         ctx.reply.integer(0);
         return;
     }
@@ -229,6 +241,9 @@ void copy(CommandContext& ctx) {
     if (expire_at >= 0) destination.setExpireAt(dst, expire_at);
 
     ctx.server.markDirty();
+    // The event belongs to the database the copy landed in, which COPY ... DB
+    // makes a different one from the caller's.
+    notifyKeyspaceEvent(ctx, notify::kGeneric, "copy_to", dst, target_db);
     ctx.reply.integer(1);
 }
 
@@ -300,18 +315,21 @@ void expireGeneric(CommandContext& ctx, std::int64_t unit_multiplier, bool absol
         // storing an expiry that the next lookup would have to clean up.
         ctx.db.erase(ctx.arg(1));
         ctx.server.markDirty();
+        notifyKeyspaceEvent(ctx, notify::kGeneric, "del", ctx.arg(1));
         ctx.reply.integer(1);
         return;
     }
 
     ctx.db.setExpireAt(ctx.arg(1), when);
     ctx.server.markDirty();
+    notifyKeyspaceEvent(ctx, notify::kGeneric, "expire", ctx.arg(1));
     ctx.reply.integer(1);
 }
 
 void ttlGeneric(CommandContext& ctx, bool in_milliseconds) {
     const std::int64_t ms = ctx.db.ttlMs(ctx.arg(1), ctx.nowMs());
     if (ms < 0) {
+        if (ms == -2) notifyKeyMiss(ctx, ctx.arg(1));
         ctx.reply.integer(ms);  // -1 no TTL, -2 no key
         return;
     }
@@ -321,6 +339,7 @@ void ttlGeneric(CommandContext& ctx, bool in_milliseconds) {
 
 void expireTimeGeneric(CommandContext& ctx, bool in_milliseconds) {
     if (!ctx.db.lookupRead(ctx.arg(1), ctx.nowMs())) {
+        notifyKeyMiss(ctx, ctx.arg(1));
         ctx.reply.integer(-2);
         return;
     }
@@ -351,7 +370,10 @@ void persist(CommandContext& ctx) {
         return;
     }
     const bool removed = ctx.db.persist(ctx.arg(1));
-    if (removed) ctx.server.markDirty();
+    if (removed) {
+        ctx.server.markDirty();
+        notifyKeyspaceEvent(ctx, notify::kGeneric, "persist", ctx.arg(1));
+    }
     ctx.reply.integer(removed ? 1 : 0);
 }
 

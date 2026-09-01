@@ -74,6 +74,15 @@ Server::Server(Config config) : config_(std::move(config)) {
     databases_.reserve(static_cast<std::size_t>(config_.databases));
     for (int i = 0; i < config_.databases; ++i) {
         databases_.push_back(std::make_unique<Database>(i));
+        // Two events no command handler is in a position to raise: a key that
+        // died of its TTL, and a key that came into existence. Both are noticed
+        // by the database itself, whichever command happened to touch it.
+        databases_.back()->setExpiredKeyCallback([this, i](const std::string& key) {
+            notifyKeyspaceEvent(notify::kExpired, "expired", key, i);
+        });
+        databases_.back()->setNewKeyCallback([this, i](const std::string& key) {
+            notifyKeyspaceEvent(notify::kNew, "new", key, i);
+        });
     }
     run_id_ = generateRunId();
 }
@@ -316,6 +325,11 @@ void Server::dispatch(Client& client, std::vector<std::string>& argv) {
     spec->handler(ctx);
     executing_fd_ = previous_executing;
 
+    if (!self_pending_.empty()) {
+        client.outputBuffer().append(self_pending_);
+        self_pending_.clear();
+    }
+
     ++stats_.commands_processed;
 }
 
@@ -356,12 +370,100 @@ Client* Server::clientByFd(int fd) {
 }
 
 void Server::queueWrite(int fd, std::string_view bytes) {
+    if (fd == executing_fd_) {
+        // A client can be a subscriber of what its own command publishes. Redis
+        // sends it the reply first and the message after, so park the frame
+        // until dispatch has finished writing the reply.
+        self_pending_.append(bytes);
+        return;
+    }
     Client* client = clientByFd(fd);
     if (!client) return;
     client->outputBuffer().append(bytes);
     // The recipient is idle as far as the loop knows, so nothing would other-
     // wise come back to flush this. Asking for writability does.
     loop_.modFd(fd, net::Ev::Read | net::Ev::Write);
+}
+
+namespace {
+
+// One message, encoded for one recipient. The frame is built against the
+// *recipient's* protocol version: the same message is a plain array to a RESP2
+// subscriber and a tagged push to a RESP3 one.
+void deliverMessage(Server& server, int fd, std::string_view kind,
+                    const std::string* pattern, const std::string& channel,
+                    const std::string& payload) {
+    Client* recipient = server.clientByFd(fd);
+    if (!recipient) return;
+
+    std::string      frame;
+    net::ReplyWriter writer(frame, recipient->protocolVersion());
+    writer.pushHeader(pattern ? 4 : 3);
+    writer.bulk(kind);
+    if (pattern) writer.bulk(*pattern);
+    writer.bulk(channel);
+    writer.bulk(payload);
+    server.queueWrite(fd, frame);
+}
+
+// The subscriber list is copied before delivery: writing to a peer can close
+// it, and closing unsubscribes it, which would invalidate an iterator over the
+// live set.
+std::vector<int> subscribersOf(PubSub& pubsub, ChannelKind kind, const std::string& channel) {
+    const std::set<int>* subscribers = pubsub.channelSubscribers(kind, channel);
+    if (!subscribers) return {};
+    return std::vector<int>(subscribers->begin(), subscribers->end());
+}
+
+}  // namespace
+
+std::int64_t Server::publishMessage(const std::string& channel, const std::string& payload) {
+    std::int64_t receivers = 0;
+    for (int fd : subscribersOf(pubsub_, ChannelKind::Global, channel)) {
+        deliverMessage(*this, fd, "message", nullptr, channel, payload);
+        ++receivers;
+    }
+
+    // No index for patterns: every one of them is tested against the channel.
+    std::vector<std::pair<std::string, std::vector<int>>> pattern_targets;
+    for (const auto& [pattern, subscribers] : pubsub_.patterns()) {
+        if (!core::globMatch(pattern, channel)) continue;
+        pattern_targets.emplace_back(pattern,
+                                     std::vector<int>(subscribers.begin(), subscribers.end()));
+    }
+    for (const auto& [pattern, fds] : pattern_targets) {
+        for (int fd : fds) {
+            deliverMessage(*this, fd, "pmessage", &pattern, channel, payload);
+            ++receivers;
+        }
+    }
+    return receivers;
+}
+
+std::int64_t Server::publishShardMessage(const std::string& channel,
+                                         const std::string& payload) {
+    std::int64_t receivers = 0;
+    for (int fd : subscribersOf(pubsub_, ChannelKind::Shard, channel)) {
+        deliverMessage(*this, fd, "smessage", nullptr, channel, payload);
+        ++receivers;
+    }
+    return receivers;
+}
+
+void Server::notifyKeyspaceEvent(std::uint32_t event_class, std::string_view event,
+                                 const std::string& key, int db_index) {
+    const std::uint32_t enabled = config_.notify_flags;
+    if (!(enabled & event_class)) return;
+
+    const std::string db = std::to_string(db_index);
+    // Keyspace first, then keyevent: a subscriber to both sees them in this
+    // order, and the differential suite pins it.
+    if (enabled & notify::kKeyspace) {
+        publishMessage("__keyspace@" + db + "__:" + key, std::string(event));
+    }
+    if (enabled & notify::kKeyevent) {
+        publishMessage("__keyevent@" + db + "__:" + std::string(event), key);
+    }
 }
 
 void Server::clearSubscriptions(Client& client) {
