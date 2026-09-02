@@ -436,11 +436,19 @@ SUITES = [
         (1, "PUBLISH", "r3", "payload"), (0, "@recv"),
         (0, "PSUBSCRIBE", "r3.*"),
         (1, "PUBLISH", "r3.sub", "patterned"), (0, "@recv"),
-        (0, "PUBLISH", "r3", "from a subscriber"),  # reply first, then its own copy
-        (0, "@recv"),
         (0, "UNSUBSCRIBE", "r3"),
         (0, "PUNSUBSCRIBE", "r3.*"),
     ], {"two_clients": True}),
+    # A publisher that is its own subscriber gets the reply to its PUBLISH
+    # first and its copy of the message after it. Redis 7.0 does it the other
+    # way round -- the message is queued while the command is still running --
+    # so this is gated at the earliest version it can be asserted at.
+    ("pubsub: a publisher that is its own subscriber", [
+        ("SUBSCRIBE", "self"),
+        ("PUBLISH", "self", "from a subscriber"),
+        ("@recv",),
+        ("UNSUBSCRIBE", "self"),
+    ], {"min_redis": (8, 0)}),
     # Connection 0 is RESP3 from the suite above, connection 1 is still RESP2:
     # one delivery, framed two different ways, and a publisher that is itself a
     # subscriber -- its own message is queued before the reply to its SPUBLISH.
@@ -452,7 +460,7 @@ SUITES = [
         (0, "@recv"), (1, "@recv"),
         (0, "SUNSUBSCRIBE", "sp"),
         (1, "SUNSUBSCRIBE", "sp"),
-    ], {"two_clients": True, "min_redis": (7, 0)}),
+    ], {"two_clients": True, "min_redis": (8, 0)}),
     ("pubsub: arity and errors", [
         ("SUBSCRIBE",), ("PSUBSCRIBE",), ("PUNSUBSCRIBE", "one"),
         ("PUBLISH",), ("PUBLISH", "c"), ("PUBLISH", "c", "m", "extra"),
@@ -879,11 +887,12 @@ SUITES = [
         ("CONFIG", "SET", "notify-keyspace-events", "KEA"),
         ("SUBSCRIBE", "__keyevent@0__:set"),
         ("SET", "kself", "v"),        # the reply comes first ...
-        ("@recv",),                   # ... and the push it caused after it
+        ("@recv",),                   # ... and the push it caused after it,
+                                      # which is redis 8's order, not 7.0's
         ("UNSUBSCRIBE", "__keyevent@0__:set"),
         ("DEL", "kself"),
         ("CONFIG", "SET", "notify-keyspace-events", ""),
-    ], {}),
+    ], {"min_redis": (8, 0)}),
     ("wrongtype errors", [
         ("DEL", "w"), ("SET", "w", "string"),
         ("LPUSH", "w", "x"), ("HSET", "w", "f", "v"), ("SADD", "w", "m"),
@@ -965,6 +974,10 @@ SUITES = [
         ("DUMP", "dz2"),
         ("OBJECT", "ENCODING", "dz1"), ("OBJECT", "ENCODING", "dz2"),
     ], {"min_redis": (8, 10)}),
+    # These two carry a DUMP whose reply is compared like any other, and the
+    # payload footer holds the RDB version -- 15 here, 14 on a redis 8.8. So
+    # they are gated with the byte-exact suites even though what they are
+    # really about is RESTORE.
     ("rdb: restore round-trips its own dump", [
         ("DEL", "r1", "r2"),
         ("RPUSH", "r1") + _QUICKLIST,
@@ -983,7 +996,7 @@ SUITES = [
         ("RESTORE", "r7", "0", "@last"), ("RESTORE", "r7", "0", "@last", "REPLACE"),
         ("TYPE", "r7"), ("SMEMBERS", "r7"),
         ("RESTORE", "r8", "1", "@last", "ABSTTL"), ("EXISTS", "r8"),
-    ], {"unordered": True}),
+    ], {"unordered": True, "min_redis": (8, 10)}),
     ("rdb: restore errors, and the order it finds them in", [
         ("DEL", "e1", "e2"), ("SET", "e1", "v"), ("DUMP", "e1"),
         ("RESTORE", "e2", "0", "not a payload at all"),
@@ -1001,7 +1014,7 @@ SUITES = [
         ("RESTORE", "e2", "notanumber", "@last"),
         ("RESTORE", "e2", "0"), ("RESTORE",), ("DUMP",), ("DUMP", "e1", "e2"),
         ("DUMP", "nosuchkey"), ("EXISTS", "e2"),
-    ], {}),
+    ], {"min_redis": (8, 10)}),
     ("rdb: debug reload keeps the keyspace identical", [
         ("FLUSHALL",),
         ("SET", "k1", "12345"), ("SET", "k2", _COMPRESSIBLE),
@@ -1022,7 +1035,7 @@ SUITES = [
         ("OBJECT", "ENCODING", "k5"), ("OBJECT", "ENCODING", "k6"),
         ("OBJECT", "ENCODING", "k7"), ("OBJECT", "ENCODING", "k8"),
         ("OBJECT", "ENCODING", "k9"),
-    ], {"unordered": True}),
+    ], {"unordered": True, "min_redis": (7, 2)}),
     ("rdb: save and bgsave", [
         ("FLUSHALL",), ("SET", "s1", "v"),
         ("SAVE",), ("BGSAVE",), ("@sleep", "0.3"),
@@ -1030,6 +1043,10 @@ SUITES = [
         ("BGSAVE", "NOSUCHARG"), ("BGSAVE", "SCHEDULE", "EXTRA"),
         ("DEBUG", "RELOAD"), ("GET", "s1"),
     ], {}),
+    # Redis printed doubles with "%.17g" until it took up grisu2 shortest
+    # digits: a 7.0 answers ZSCORE with "1e+18" where an 8.8 answers
+    # "1000000000000000000". mnemos is the modern one, and 8.0 is the earliest
+    # version this can be asserted at.
     ("doubles: the printed form of a score", [
         ("DEL", "f1", "f2"),
         ("ZADD", "f1") + tuple(x for d in _DOUBLES for x in (d, "m" + d)),
@@ -1044,7 +1061,7 @@ SUITES = [
                                for x in (d, _LONG_MEMBER + d)),
     ] + [("ZSCORE", "f2", _LONG_MEMBER + d) for d in _DOUBLES] + [
         ("OBJECT", "ENCODING", "f1"), ("OBJECT", "ENCODING", "f2"),
-    ], {}),
+    ], {"min_redis": (8, 0)}),
     ("doubles: RESP3 says them the same way", [
         ("@hello3",), ("DEL", "f3"),
         ("ZADD", "f3") + tuple(x for d in _DOUBLES
@@ -1052,7 +1069,7 @@ SUITES = [
     ] + [("ZSCORE", "f3", _LONG_MEMBER + d) for d in _DOUBLES] + [
         ("ZSCORE", "f3", "nosuchmember"),
         ("ZADD", "f3", "INCR", "1", _LONG_MEMBER + "1"),
-    ], {}),
+    ], {"min_redis": (8, 0)}),
 ]
 
 

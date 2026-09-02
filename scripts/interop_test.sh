@@ -192,50 +192,66 @@ if command -v redis-server >/dev/null 2>&1; then
     # redis-cli prints an array one element per line when it is not a tty.
     LIST="$(printf 'a\nb\nc\n1\n2\n3')"
     BACKLIST="$(printf 'x\ny\nz')"
+    REF_PORT=$((PORT + 1))
+    RDB_PORT=$((PORT + 2))
+
+    # mnemos writes RDB version 15, which is redis 8.10's. An older redis
+    # refuses to load a file from the future and exits, so that direction is
+    # gated on the version rather than left to look like a crash. The other
+    # direction has no such limit: mnemos loads any version up to its own.
+    REF_MAJOR=0
+    REF_MINOR=0
+    read -r REF_MAJOR REF_MINOR <<<"$(redis-server --version |
+        sed -n 's/.*v=\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')"
 
     say
     say "== rdb: a file mnemos wrote, opened by redis =="
-    REF_PORT=$((PORT + 1))
-    r FLUSHALL >/dev/null
-    r SET rdb_str hello >/dev/null
-    r SET rdb_int 12345 >/dev/null
-    r SET rdb_lzf "$LZF" >/dev/null
-    r RPUSH rdb_list a b c 1 2 3 >/dev/null
-    r RPUSH rdb_big "${BIG[@]}" >/dev/null
-    r SADD rdb_intset 1 2 3 >/dev/null
-    r SADD rdb_set a b c >/dev/null
-    r HSET rdb_hash f1 v1 f2 v2 >/dev/null
-    r ZADD rdb_zset 1 a 2.5 b >/dev/null
-    r SET rdb_ttl v >/dev/null
-    r EXPIRE rdb_ttl 10000 >/dev/null
-    r SAVE >/dev/null
+    if (( REF_MAJOR > 8 || (REF_MAJOR == 8 && REF_MINOR >= 10) )); then
+        r FLUSHALL >/dev/null
+        r SET rdb_str hello >/dev/null
+        r SET rdb_int 12345 >/dev/null
+        r SET rdb_lzf "$LZF" >/dev/null
+        r RPUSH rdb_list a b c 1 2 3 >/dev/null
+        r RPUSH rdb_big "${BIG[@]}" >/dev/null
+        r SADD rdb_intset 1 2 3 >/dev/null
+        r SADD rdb_set a b c >/dev/null
+        r HSET rdb_hash f1 v1 f2 v2 >/dev/null
+        r ZADD rdb_zset 1 a 2.5 b >/dev/null
+        r SET rdb_ttl v >/dev/null
+        r EXPIRE rdb_ttl 10000 >/dev/null
+        r SAVE >/dev/null
 
-    redis-server --port "$REF_PORT" --dir "${WORKDIR}/mnemos" --appendonly no \
+        redis-server --port "$REF_PORT" --dir "${WORKDIR}/mnemos" --appendonly no \
+            --save '' --daemonize yes >/dev/null 2>&1
+        if await "$REF_PORT"; then
+            at "$REF_PORT" "redis loaded the file"  "10"        DBSIZE
+            at "$REF_PORT" "string survived"        "hello"     GET rdb_str
+            at "$REF_PORT" "int encoding survived"  "int"       OBJECT ENCODING rdb_int
+            at "$REF_PORT" "lzf string survived"    "$LZF"      GET rdb_lzf
+            at "$REF_PORT" "list survived"          "$LIST"     LRANGE rdb_list 0 -1
+            at "$REF_PORT" "quicklist survived"     "400"       LLEN rdb_big
+            at "$REF_PORT" "quicklist encoding"     "quicklist" OBJECT ENCODING rdb_big
+            at "$REF_PORT" "last element intact"    "${BIG[399]}" LINDEX rdb_big -1
+            at "$REF_PORT" "intset encoding"        "intset"    OBJECT ENCODING rdb_intset
+            at "$REF_PORT" "listpack set encoding"  "listpack"  OBJECT ENCODING rdb_set
+            at "$REF_PORT" "hash survived"          "v2"        HGET rdb_hash f2
+            at "$REF_PORT" "zset survived"          "2.5"       ZSCORE rdb_zset b
+            at "$REF_PORT" "ttl survived"           "1"         PERSIST rdb_ttl
+        else
+            printf '  FAIL redis-server would not start on the file mnemos wrote\n'
+            fail=$((fail + 1))
+        fi
+        redis-cli -p "$REF_PORT" shutdown nosave 2>/dev/null
+    else
+        say "  (skipped: redis ${REF_MAJOR}.${REF_MINOR} predates RDB version 15)"
+    fi
+
+    say
+    say "== rdb: a file redis wrote, opened by mnemos =="
+    redis-server --port "$REF_PORT" --dir "${WORKDIR}/redis" --appendonly no \
         --save '' --daemonize yes >/dev/null 2>&1
     if await "$REF_PORT"; then
-        at "$REF_PORT" "redis loaded the file"  "10"        DBSIZE
-        at "$REF_PORT" "string survived"        "hello"     GET rdb_str
-        at "$REF_PORT" "int encoding survived"  "int"       OBJECT ENCODING rdb_int
-        at "$REF_PORT" "lzf string survived"    "$LZF"      GET rdb_lzf
-        at "$REF_PORT" "list survived"          "$LIST"     LRANGE rdb_list 0 -1
-        at "$REF_PORT" "quicklist survived"     "400"       LLEN rdb_big
-        at "$REF_PORT" "quicklist encoding"     "quicklist" OBJECT ENCODING rdb_big
-        at "$REF_PORT" "last element intact"    "${BIG[399]}" LINDEX rdb_big -1
-        at "$REF_PORT" "intset encoding"        "intset"    OBJECT ENCODING rdb_intset
-        at "$REF_PORT" "listpack set encoding"  "listpack"  OBJECT ENCODING rdb_set
-        at "$REF_PORT" "hash survived"          "v2"        HGET rdb_hash f2
-        at "$REF_PORT" "zset survived"          "2.5"       ZSCORE rdb_zset b
-        at "$REF_PORT" "ttl survived"           "1"         PERSIST rdb_ttl
-
-        say
-        say "== rdb: a file redis wrote, opened by mnemos =="
-        # `dir` is a protected config from redis 7 on, so the other direction
-        # gets its own server started in the right directory rather than a
-        # CONFIG SET that would be refused.
-        redis-cli -p "$REF_PORT" shutdown nosave 2>/dev/null
-        redis-server --port "$REF_PORT" --dir "${WORKDIR}/redis" --appendonly no \
-            --save '' --daemonize yes >/dev/null 2>&1
-        await "$REF_PORT"
+        redis-cli -p "$REF_PORT" FLUSHALL >/dev/null
         redis-cli -p "$REF_PORT" SET back_str world >/dev/null
         redis-cli -p "$REF_PORT" SET back_lzf "$LZF" >/dev/null
         redis-cli -p "$REF_PORT" RPUSH back_list x y z >/dev/null
@@ -252,7 +268,6 @@ if command -v redis-server >/dev/null 2>&1; then
         # A second mnemos, pointed at the directory redis just wrote into.
         # Loading at startup is the only path that reads a file nothing in this
         # process produced.
-        RDB_PORT=$((PORT + 2))
         "$SERVER" --port "$RDB_PORT" --dir "${WORKDIR}/redis" >>"$LOG" 2>&1 &
         RDB_PID=$!
         if await "$RDB_PORT"; then
@@ -268,11 +283,12 @@ if command -v redis-server >/dev/null 2>&1; then
             at "$RDB_PORT" "zset survived"          "1.5"      ZSCORE back_zset a
             at "$RDB_PORT" "ttl survived"           "1"        PERSIST back_ttl
         else
-            printf '  FAIL mnemos did not start on the redis-written file\n'
+            printf '  FAIL mnemos would not start on the file redis wrote\n'
             fail=$((fail + 1))
         fi
     else
-        say "  (skipped: redis-server would not start on the mnemos file)"
+        printf '  FAIL redis-server would not start\n'
+        fail=$((fail + 1))
     fi
 fi
 
