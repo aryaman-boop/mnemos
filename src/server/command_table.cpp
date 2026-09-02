@@ -106,6 +106,10 @@ const std::vector<CommandSpec>& table() {
         {"debug",         cmd::debug,              -2,  kAdmin,                       0,  0,  0},
         {"time",          cmd::time,                1,  kFast | kLoading,             0,  0,  0},
         {"lastsave",      cmd::lastsave,            1,  kFast | kLoading,             0,  0,  0},
+        {"save",          cmd::save,                1,  kAdmin,                       0,  0,  0},
+        {"bgsave",        cmd::bgsave,             -1,  kAdmin,                       0,  0,  0},
+        {"dump",          cmd::dump,                2,  kReadOnly,                    1,  1,  1},
+        {"restore",       cmd::restore,            -4,  kWrite,                       1,  1,  1},
         {"shutdown",      cmd::shutdown,           -1,  kAdmin | kNoAuth | kLoading,  0,  0,  0},
 
         {"lpush",         cmd::lpush,              -3,  kWrite | kFast,               1,  1,  1},
@@ -225,6 +229,21 @@ void wrongArgs(net::ReplyWriter& w, std::string_view command) {
     w.error("ERR " + wrongArgsText(command));
 }
 void ok(net::ReplyWriter& w) { w.simpleString("OK"); }
+
+void badDumpPayload(net::ReplyWriter& w) {
+    w.error("ERR DUMP payload version or checksum are wrong");
+}
+void badDataFormat(net::ReplyWriter& w) { w.error("ERR Bad data format"); }
+void busyKey(net::ReplyWriter& w) { w.error("BUSYKEY Target key name already exists."); }
+void invalidRestoreTtl(net::ReplyWriter& w) {
+    w.error("ERR Invalid TTL value, must be >= 0");
+}
+void invalidIdletime(net::ReplyWriter& w) {
+    w.error("ERR Invalid IDLETIME value, must be >= 0");
+}
+void invalidFreq(net::ReplyWriter& w) {
+    w.error("ERR Invalid FREQ value, must be >= 0 and <= 255");
+}
 
 std::string wrongArgsText(std::string_view command) {
     std::string msg = "wrong number of arguments for '";

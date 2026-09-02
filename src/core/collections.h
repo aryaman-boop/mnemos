@@ -78,6 +78,11 @@ public:
     // Exposed for the RDB writer, which needs the raw listpack when the hash is
     // small enough to be stored in its compact form.
     const Listpack& listpack() const { return listpack_; }
+    // The inverse, for the RDB reader: take a listpack off disk as-is, then
+    // apply the same limits a load applies, so a hash saved under one set of
+    // thresholds is re-encoded under ours. False when the element count is odd,
+    // i.e. the blob is not field/value pairs at all.
+    bool adoptListpack(Listpack lp);
 
     void convertToHashTable();
 
@@ -114,6 +119,12 @@ public:
 
     const IntSet&   intset() const { return intset_; }
     const Listpack& listpack() const { return listpack_; }
+    // RDB load: adopt a serialised encoding verbatim, then re-apply the limits.
+    // Taking the intset bytes rather than re-adding the members is what keeps
+    // its width sticky -- an 8-byte-wide set whose large member was deleted
+    // before the save comes back 8 bytes wide, exactly as Redis does.
+    void adoptIntSet(IntSet is);
+    void adoptListpack(Listpack lp);
 
     void convertToListpack();
     void convertToHashTable();
@@ -154,6 +165,9 @@ public:
     std::vector<std::pair<std::string, double>> rangeByScore(const ScoreRange& range) const;
 
     const Listpack& listpack() const { return listpack_; }
+    // RDB load. The blob is already ordered by (score, member); adopting it
+    // keeps that order rather than paying to re-sort what Redis already sorted.
+    bool adoptListpack(Listpack lp);
 
     void convertToSkipList();
 
@@ -192,6 +206,9 @@ public:
     std::optional<std::size_t> indexOf(std::string_view value) const;
 
     const std::vector<Listpack>& nodes() const { return nodes_; }
+    // RDB load: the quicklist's nodes, as they were written. False when there
+    // is nothing in them -- an empty list is not a value Redis ever stores.
+    bool adoptNodes(std::vector<Listpack> nodes);
 
 private:
     void maybeConvert();

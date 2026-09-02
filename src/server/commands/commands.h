@@ -156,6 +156,12 @@ void zpopmin(CommandContext&);
 void zpopmax(CommandContext&);
 void zrandmember(CommandContext&);
 
+// --- persist_commands.cpp ---------------------------------------------------
+void dump(CommandContext&);
+void restore(CommandContext&);
+void save(CommandContext&);
+void bgsave(CommandContext&);
+
 // --- transaction_commands.cpp ---
 void multi(CommandContext&);
 void exec(CommandContext&);

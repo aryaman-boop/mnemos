@@ -263,6 +263,29 @@ public:
 
     const std::string& runId() const { return run_id_; }
 
+    // --- persistence (src/server/persistence.cpp) ---------------------------
+    // config().dir joined with config().dbfilename.
+    std::string rdbPath() const;
+    // Writes every non-empty database to the snapshot, then records the save.
+    // False on any I/O error, with the reason in `error`.
+    bool saveRdb(std::string& error);
+    // The same snapshot taken by a forked child, so the parent never blocks.
+    // Copy-on-write is what makes that safe: the child sees the keyspace as it
+    // was at the instant of the fork and nothing after it.
+    bool startBackgroundSave(std::string& error);
+    bool bgsaveInProgress() const { return bgsave_pid_ != -1; }
+    // Save, empty, load -- DEBUG RELOAD, and the one command that asserts a
+    // save and a load are inverses.
+    bool reloadRdb(std::string& error);
+    // Reads the snapshot at startup. False means the file was there and could
+    // not be parsed, which is a reason to refuse to start rather than to come
+    // up empty and overwrite it on the next save.
+    bool loadRdbAtStartup();
+
+    std::int64_t  lastSaveTime() const { return last_save_time_; }
+    std::uint64_t rdbSaves() const { return rdb_saves_; }
+    bool          lastBgsaveOk() const { return last_bgsave_ok_; }
+
     // Closes a connection and frees its state. Safe to call from a command
     // handler acting on *another* client; deferred when it targets the client
     // whose command is currently executing.
@@ -276,6 +299,15 @@ private:
     void processInputBuffer(Client& client);
     void dispatch(Client& client, std::vector<std::string>& argv);
     void serverCron();
+    // Writes the file and nothing else. Split out because the BGSAVE child must
+    // not touch the bookkeeping -- it exits, and the parent records the save
+    // when it reaps the child.
+    bool writeRdbFile(std::string& error);
+    // Collects a finished BGSAVE child, once per cron tick.
+    void reapBackgroundSave();
+    // Hands one loaded key to a database. Shared by startup and DEBUG RELOAD.
+    void restoreLoadedKey(int db_index, std::string key, Value value,
+                          std::int64_t expire_at_ms);
 
     Config                                          config_;
     net::EventLoop                                  loop_;
@@ -297,6 +329,20 @@ private:
     Stats                                           stats_;
     std::string                                     run_id_;
     int                                             executing_fd_ = -1;
+    std::int64_t                                    last_save_time_ = 0;
+    std::uint64_t                                   rdb_saves_      = 0;
+    // -1 when no BGSAVE child is running. A pid, not a thread: the command path
+    // is single-threaded by design, and a fork is how Redis gets a consistent
+    // snapshot without stopping it.
+    int                                             bgsave_pid_     = -1;
+    std::uint64_t                                   dirty_at_fork_  = 0;
+    bool                                            last_bgsave_ok_ = true;
+    // While a load is in progress, keys appearing in the keyspace are not news
+    // anyone asked about: RDB loading raises no keyspace events in Redis.
+    bool                                            loading_        = false;
+    // Set when the emit callback is handed a database index this server does
+    // not have, which is a malformed file rather than a missing key.
+    bool                                            load_failed_    = false;
 };
 
 }  // namespace mnemos::server

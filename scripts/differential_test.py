@@ -27,6 +27,8 @@ class Client:
         self.name = name
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
         self.buf = b""
+        # The last bulk reply this connection saw, for the `@last` placeholder.
+        self.last = b""
 
     def _fill(self):
         chunk = self.sock.recv(65536)
@@ -56,7 +58,15 @@ class Client:
             while len(self.buf) < n + 2:
                 self._fill()
             data, self.buf = self.buf[:n], self.buf[n + 2:]
-            return ("bulk", data.decode("utf-8", "replace"))
+            # Text where it is text, raw bytes where it is not. A DUMP payload
+            # is neither UTF-8 nor meant to be read, and decoding it with
+            # errors="replace" would map two *different* payloads onto the same
+            # string -- which is exactly the difference these suites exist to
+            # catch.
+            try:
+                return ("bulk", data.decode("utf-8"))
+            except UnicodeDecodeError:
+                return ("bulk", data)
         if kind == b"*":
             n = int(rest)
             if n == -1:
@@ -97,6 +107,15 @@ class Client:
         self.sock.close()
 
 
+def show(args):
+    """A command as one printable line. Arguments are not always text -- a
+    RESTORE payload is raw bytes -- and neither is every reply."""
+    parts = []
+    for a in args:
+        parts.append(a if isinstance(a, str) else repr(a))
+    return " ".join(parts)
+
+
 def normalise(reply, unordered=False):
     """Collapses differences Redis does not guarantee."""
     kind, value = reply
@@ -121,6 +140,28 @@ def normalise(reply, unordered=False):
 #                  (i, "@sleep", secs)  wait, for events raised by a timer
 #                  (i, "@hello3") switch connection i to RESP3, ignoring the
 #                                 reply, whose contents are server-specific
+#                The argument "@last" stands for the last bulk reply that same
+#                connection received, which is how a suite feeds a DUMP payload
+#                back into RESTORE without either server ever seeing the other's
+#                bytes.
+
+# Values chosen to land in one specific encoding each, because an RDB payload
+# records the encoding and not only the contents. A payload that matched byte
+# for byte while the two servers held the value differently would be a
+# coincidence, not a pass.
+_COMPRESSIBLE = "abcabcabc-" * 40          # long enough to be offered to LZF
+_HUGE = "z" * 70000                        # over the quicklist safety limit
+_QUICKLIST = tuple("element-number-%03d-%s" % (i, "padding-" * 6)
+                   for i in range(400))    # several nodes, so boundaries matter
+_LONG_MEMBER = "m" * 70                    # over zset-max-listpack-value
+
+# Every double whose printed form is decided by a different branch: the integer
+# fast path and both of its limits, the two notations and the switch between
+# them, the subnormal, and the signed zero.
+_DOUBLES = ("1", "-1", "3.0e10", "1e18", "4611686018427387904", "4.7e18",
+            "1e19", "1.2345e21", "1.2345e22", "1e100", "-1e-7", "1e-6",
+            "0.0001", "5e-324", "633869777.43339539", "-0", "1.5", "-2.25")
+
 SUITES = [
     ("list: push/pop/range", [
         ("DEL", "l"), ("RPUSH", "l", "a", "b", "c"), ("LPUSH", "l", "z"),
@@ -873,6 +914,145 @@ SUITES = [
         ("MULTI",), ("GET", "r3"), ("EXEC",),
         ("DEL", "r3"),
     ], {}),
+
+    # --- RDB ------------------------------------------------------------------
+    # The payload is the on-disk format with a version and a checksum stapled
+    # on, so a DUMP that matches byte for byte is the whole codec agreeing:
+    # length prefixes, integer and LZF string encodings, listpack layout,
+    # quicklist node boundaries, the score text inside a sorted set. It is
+    # pinned to a reference version because the version byte in the footer --
+    # and occasionally the encodings themselves -- change between releases.
+    ("rdb: dump is byte-exact, strings", [
+        ("DEL", "d1", "d2", "d3", "d4", "d5"),
+        ("SET", "d1", "12345"), ("DUMP", "d1"),
+        ("SET", "d2", "-9223372036854775808"), ("DUMP", "d2"),
+        ("SET", "d3", "007"), ("DUMP", "d3"),          # not an integer: leading zero
+        ("SET", "d4", "hello"), ("DUMP", "d4"),
+        ("SET", "d5", _COMPRESSIBLE), ("DUMP", "d5"),
+        ("OBJECT", "ENCODING", "d1"), ("OBJECT", "ENCODING", "d4"),
+        ("OBJECT", "ENCODING", "d5"),
+    ], {"min_redis": (8, 10)}),
+    ("rdb: dump is byte-exact, lists", [
+        ("DEL", "dl1", "dl2", "dl3"),
+        ("RPUSH", "dl1", "a", "b", "c", "1", "2", "3"), ("DUMP", "dl1"),
+        ("RPUSH", "dl2") + _QUICKLIST, ("DUMP", "dl2"),
+        # One element too large for any listpack: its own node, written plain.
+        ("RPUSH", "dl3", _HUGE, "x", "y"), ("DUMP", "dl3"),
+        ("OBJECT", "ENCODING", "dl1"), ("OBJECT", "ENCODING", "dl2"),
+        ("LLEN", "dl2"), ("LRANGE", "dl3", "1", "-1"),
+    ], {"min_redis": (8, 10)}),
+    ("rdb: dump is byte-exact, sets and hashes", [
+        ("DEL", "ds1", "ds2", "dh1"),
+        ("SADD", "ds1") + tuple(str(i) for i in range(200)), ("DUMP", "ds1"),
+        ("SADD", "ds2", "a", "b", "hello"), ("DUMP", "ds2"),
+        # Deliberately still a listpack: a hash big enough to become a hash
+        # table is not byte-comparable, because nothing fixes the order its
+        # fields come out in.
+        ("HSET", "dh1", "f1", "v1", "f2", "2", "f3", "-9223372036854775808"),
+        ("DUMP", "dh1"),
+        ("OBJECT", "ENCODING", "ds1"), ("OBJECT", "ENCODING", "ds2"),
+        ("OBJECT", "ENCODING", "dh1"),
+    ], {"min_redis": (8, 10)}),
+    ("rdb: dump is byte-exact, sorted sets", [
+        ("DEL", "dz1", "dz2"),
+        ("ZADD", "dz1", "1", "a", "2.5", "b", "-0", "c", "3.0e10", "d",
+         "inf", "e", "-inf", "f"),
+        ("DUMP", "dz1"),
+        # Skiplist-encoded: scores go down as raw doubles, in score order, so
+        # this one is byte-comparable where a hash table would not be.
+        ("ZADD", "dz2") + tuple(x for i in range(200)
+                                for x in (str(i * 1.5), "member-%03d" % i)),
+        ("DUMP", "dz2"),
+        ("OBJECT", "ENCODING", "dz1"), ("OBJECT", "ENCODING", "dz2"),
+    ], {"min_redis": (8, 10)}),
+    ("rdb: restore round-trips its own dump", [
+        ("DEL", "r1", "r2"),
+        ("RPUSH", "r1") + _QUICKLIST,
+        ("DUMP", "r1"), ("RESTORE", "r2", "0", "@last"),
+        ("LLEN", "r2"), ("LRANGE", "r2", "0", "2"), ("LRANGE", "r2", "-2", "-1"),
+        ("OBJECT", "ENCODING", "r2"), ("TTL", "r2"),
+        ("DEL", "r3"), ("ZADD", "r3", "1.5", "a", "2", _LONG_MEMBER),
+        ("DUMP", "r3"), ("RESTORE", "r4", "0", "@last"),
+        ("ZRANGE", "r4", "0", "-1", "WITHSCORES"), ("OBJECT", "ENCODING", "r4"),
+        ("DEL", "r5"), ("SADD", "r5", "1", "2", "3"),
+        ("DUMP", "r5"), ("RESTORE", "r6", "100000", "@last"),
+        ("SMEMBERS", "r6"), ("OBJECT", "ENCODING", "r6"), ("TTL", "r6"),
+        # REPLACE over a key of a different type, and ABSTTL's already-past
+        # deadline, which deletes the key instead of setting one.
+        ("SET", "r7", "in the way"),
+        ("RESTORE", "r7", "0", "@last"), ("RESTORE", "r7", "0", "@last", "REPLACE"),
+        ("TYPE", "r7"), ("SMEMBERS", "r7"),
+        ("RESTORE", "r8", "1", "@last", "ABSTTL"), ("EXISTS", "r8"),
+    ], {"unordered": True}),
+    ("rdb: restore errors, and the order it finds them in", [
+        ("DEL", "e1", "e2"), ("SET", "e1", "v"), ("DUMP", "e1"),
+        ("RESTORE", "e2", "0", "not a payload at all"),
+        ("RESTORE", "e2", "0", "@last", "NOSUCHOPTION"),
+        ("RESTORE", "e2", "0", "@last", "IDLETIME", "-1"),
+        ("RESTORE", "e2", "0", "@last", "IDLETIME", "x"),
+        ("RESTORE", "e2", "0", "@last", "FREQ", "256"),
+        ("RESTORE", "e2", "0", "@last", "FREQ", "-1"),
+        ("RESTORE", "e1", "0", "@last"),
+        # A syntax error is found before the key is in the way, and the key is
+        # in the way before the TTL is even parsed.
+        ("RESTORE", "e1", "0", "@last", "NOSUCHOPTION"),
+        ("RESTORE", "e1", "-1", "@last"),
+        ("RESTORE", "e2", "-1", "@last"),
+        ("RESTORE", "e2", "notanumber", "@last"),
+        ("RESTORE", "e2", "0"), ("RESTORE",), ("DUMP",), ("DUMP", "e1", "e2"),
+        ("DUMP", "nosuchkey"), ("EXISTS", "e2"),
+    ], {}),
+    ("rdb: debug reload keeps the keyspace identical", [
+        ("FLUSHALL",),
+        ("SET", "k1", "12345"), ("SET", "k2", _COMPRESSIBLE),
+        ("RPUSH", "k3", "a", "b", "c"), ("RPUSH", "k4") + _QUICKLIST,
+        ("SADD", "k5", "1", "2", "3"), ("SADD", "k6", "a", "b"),
+        ("HSET", "k7", "f", "v"), ("ZADD", "k8", "1", "a", "2.5", "b"),
+        ("ZADD", "k9") + tuple(x for i in range(200)
+                               for x in (str(i), "m-%03d" % i)),
+        ("SET", "k10", "expiring"), ("EXPIRE", "k10", "10000"),
+        ("DEBUG", "RELOAD"),
+        ("DBSIZE",), ("GET", "k1"), ("GET", "k2"),
+        ("LRANGE", "k3", "0", "-1"), ("LLEN", "k4"), ("LINDEX", "k4", "399"),
+        ("SMEMBERS", "k5"), ("SMEMBERS", "k6"), ("HGETALL", "k7"),
+        ("ZRANGE", "k8", "0", "-1", "WITHSCORES"), ("ZCARD", "k9"),
+        ("ZSCORE", "k9", "m-199"), ("TTL", "k10"),
+        ("OBJECT", "ENCODING", "k1"), ("OBJECT", "ENCODING", "k2"),
+        ("OBJECT", "ENCODING", "k3"), ("OBJECT", "ENCODING", "k4"),
+        ("OBJECT", "ENCODING", "k5"), ("OBJECT", "ENCODING", "k6"),
+        ("OBJECT", "ENCODING", "k7"), ("OBJECT", "ENCODING", "k8"),
+        ("OBJECT", "ENCODING", "k9"),
+    ], {"unordered": True}),
+    ("rdb: save and bgsave", [
+        ("FLUSHALL",), ("SET", "s1", "v"),
+        ("SAVE",), ("BGSAVE",), ("@sleep", "0.3"),
+        ("BGSAVE", "SCHEDULE"), ("@sleep", "0.3"),
+        ("BGSAVE", "NOSUCHARG"), ("BGSAVE", "SCHEDULE", "EXTRA"),
+        ("DEBUG", "RELOAD"), ("GET", "s1"),
+    ], {}),
+    ("doubles: the printed form of a score", [
+        ("DEL", "f1", "f2"),
+        ("ZADD", "f1") + tuple(x for d in _DOUBLES for x in (d, "m" + d)),
+    ] + [("ZSCORE", "f1", "m" + d) for d in _DOUBLES] + [
+        ("ZRANGE", "f1", "0", "-1", "WITHSCORES"),
+        ("ZINCRBY", "f1", "0.5", "m1.5"), ("ZINCRBY", "f1", "1e18", "m1"),
+        ("ZADD", "f1", "INCR", "0.25", "m-2.25"),
+        # The same values in a skiplist, where the score is a raw double rather
+        # than text a listpack had to hold -- which is where a negative zero
+        # keeps its sign.
+        ("ZADD", "f2") + tuple(x for d in _DOUBLES
+                               for x in (d, _LONG_MEMBER + d)),
+    ] + [("ZSCORE", "f2", _LONG_MEMBER + d) for d in _DOUBLES] + [
+        ("OBJECT", "ENCODING", "f1"), ("OBJECT", "ENCODING", "f2"),
+    ], {}),
+    ("doubles: RESP3 says them the same way", [
+        ("@hello3",), ("DEL", "f3"),
+        ("ZADD", "f3") + tuple(x for d in _DOUBLES
+                               for x in (d, _LONG_MEMBER + d)),
+    ] + [("ZSCORE", "f3", _LONG_MEMBER + d) for d in _DOUBLES] + [
+        ("ZSCORE", "f3", "nosuchmember"),
+        ("ZADD", "f3", "INCR", "1", _LONG_MEMBER + "1"),
+    ], {}),
 ]
 
 
@@ -902,7 +1082,11 @@ def issue(client, args):
         # cycle, so there is nothing to send that would provoke it.
         time.sleep(float(args[1]))
         return ("status", "slept")
-    return client.cmd(*args)
+    args = tuple(client.last if a == "@last" else a for a in args)
+    reply = client.cmd(*args)
+    if reply[0] == "bulk":
+        client.last = reply[1]
+    return reply
 
 
 def run_suite(a, b, name, commands, flags):
@@ -961,7 +1145,7 @@ def main():
         else:
             print(f"  FAIL {name}")
             for cmd, ra, rb in failures:
-                print(f"         {' '.join(cmd)}")
+                print(f"         {show(cmd)}")
                 print(f"           mnemos: {ra}")
                 print(f"           redis : {rb}")
             total_failures += len(failures)

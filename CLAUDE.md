@@ -54,6 +54,7 @@ frame — `UNSUBSCRIBE a b` sends two and desyncs the connection.
 ```
 src/net/       event loop (kqueue/epoll), RESP2+RESP3 parse and serialise
 src/core/      value objects, encodings: listpack, intset, skiplist, dict
+src/persist/   the RDB codec: CRC64, LZF, lengths, objects, whole files
 src/server/    server, connections, databases, command dispatch
 src/server/commands/   one file per command family
 tests/         unit tests (ctest, harness in tests/test_harness.h)
@@ -61,8 +62,8 @@ scripts/       interop + differential suites
 ```
 
 `CMakeLists.txt` globs `src/**/*.cpp` with `CONFIGURE_DEPENDS` — new source
-files need no build-file edit. `src/persist/`, `src/repl/`, `src/mcp/` are
-already wired in the glob and will build as soon as they contain sources.
+files need no build-file edit. `src/repl/` and `src/mcp/` are already wired in
+the glob and will build as soon as they contain sources.
 
 ## Adding a command
 
@@ -139,10 +140,39 @@ the whole of the atomicity. There is no rollback, so a command that fails inside
   delete that follows is not counted as a change — the watcher had already seen
   it as gone.
 
+## RDB
+
+`src/persist/rdb.{h,cpp}` is the real format, not an approximation: files
+mnemos writes are loaded by a live `redis-server` and vice versa (the last two
+sections of `scripts/interop_test.sh`), and `DUMP` payloads are compared byte
+for byte (the `rdb:` suites). Version 15, CRC-64/Jones, liblzf ported.
+
+- A value is written **in the encoding it is actually in**, so `OBJECT
+  ENCODING` still tells the truth after `DEBUG RELOAD`. The pre-listpack types
+  (ziplist, zipmap, `RDB_TYPE_LIST`) are rejected, not half-read — redis 8
+  never writes them.
+- Quicklist nodes: an element over 8192 bytes (`isLargeElement` at
+  `list-max-listpack-size -2`) gets a node of its own, written with container
+  byte 1 and no listpack around it. Otherwise a node takes elements while
+  `node->sz + raw_len + 11 <= 8192`. mnemos has no separate plain node — a node
+  holding one oversized element *is* one, and `saveObjectBody` is where the two
+  representations meet.
+- LZF is offered any string over 20 bytes and kept only if it saved at least
+  four, which is expressed by handing it an output buffer four bytes short.
+- **Doubles go through `core::d2string`** (`src/core/dtoa.h`), which is Redis's:
+  `double2ll`'s integer fast path (exact integers within ±2^62 print in full,
+  and `-0.0` prints `0`), else grisu2 shortest digits with a *signed* exponent
+  (`1e+100`). `net::formatDouble` is d2string with the one case taken back —
+  a reply says `-0`. The difference is visible: a listpack-encoded score has
+  already lost the sign, a skiplist-encoded one has not.
+- Hashtable-encoded `SET` and `HASH` are **not** byte-comparable against real
+  redis — their iteration order is unspecified. Everything else is, intsets and
+  listpacks and quicklists and `ZSET_2` included; keep new differential cases
+  under the encoding thresholds so they stay so.
+
 ## Not yet implemented
 
-RDB persistence (real format), AOF with rewrite, replication over `PSYNC`,
-the MCP server.
+AOF with rewrite, replication over `PSYNC`, the MCP server.
 Unimplemented commands return an unknown-command error rather than a stub.
 
 ## Working agreement

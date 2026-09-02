@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstdio>
 
-#include "net/resp.h"
+#include "core/dtoa.h"
 
 namespace mnemos::core {
 
@@ -15,9 +15,10 @@ const EncodingLimits& defaultLimits() {
 
 namespace {
 
-// Scores are stored in listpacks as text. Reuse the reply formatter so the
-// round trip is exact and matches what ZSCORE would print.
-std::string scoreToString(double score) { return net::formatDouble(score); }
+// Scores are stored in listpacks as text -- these exact bytes are what a DUMP
+// of the sorted set contains, so the formatting has to be Redis's d2string and
+// not merely something that round-trips.
+std::string scoreToString(double score) { return d2string(score); }
 
 double scoreFromString(std::string_view s) {
     return std::strtod(std::string(s).c_str(), nullptr);
@@ -76,6 +77,28 @@ void HashValue::convertToHashTable() {
     }
     listpack_.clear();
     encoding_ = ObjEncoding::HashTable;
+}
+
+bool HashValue::adoptListpack(Listpack lp) {
+    // Field and value are consecutive elements, so an odd count is not a hash.
+    if (lp.numElements() % 2 != 0) return false;
+
+    std::size_t longest = 0;
+    lp.forEach([&longest](const Listpack::Element& element) {
+        if (!element.is_integer) longest = std::max(longest, element.string.size());
+    });
+
+    listpack_ = std::move(lp);
+    encoding_ = ObjEncoding::ListPack;
+
+    // The thresholds are re-applied rather than trusted: the blob may have been
+    // written by a server configured with larger limits than ours.
+    const EncodingLimits& limits = defaultLimits();
+    if (listpack_.numElements() / 2 > limits.hash_max_listpack_entries ||
+        longest > limits.hash_max_listpack_value) {
+        convertToHashTable();
+    }
+    return true;
 }
 
 bool HashValue::set(std::string_view field, std::string_view value) {
@@ -179,6 +202,28 @@ void SetValue::convertToHashTable() {
         listpack_.clear();
     }
     encoding_ = ObjEncoding::HashTable;
+}
+
+void SetValue::adoptIntSet(IntSet is) {
+    intset_ = std::move(is);
+    encoding_ = ObjEncoding::IntSet;
+
+    const EncodingLimits& limits = defaultLimits();
+    if (intset_.size() > limits.set_max_intset_entries) {
+        if (intset_.size() <= limits.set_max_listpack_entries) convertToListpack();
+        else                                                   convertToHashTable();
+    }
+}
+
+void SetValue::adoptListpack(Listpack lp) {
+    listpack_ = std::move(lp);
+    encoding_ = ObjEncoding::ListPack;
+
+    // Only the entry count, deliberately: Redis does not re-check member length
+    // here, so a listpack holding a long member stays a listpack on both sides.
+    if (listpack_.numElements() > defaultLimits().set_max_listpack_entries) {
+        convertToHashTable();
+    }
 }
 
 bool SetValue::add(std::string_view member) {
@@ -296,6 +341,29 @@ void ZSetValue::convertToSkipList() {
     }
     listpack_.clear();
     encoding_ = ObjEncoding::SkipList;
+}
+
+bool ZSetValue::adoptListpack(Listpack lp) {
+    if (lp.numElements() % 2 != 0) return false;
+
+    // Members are the even elements; the odd ones are scores, whose length the
+    // limit has nothing to say about.
+    std::size_t longest = 0;
+    for (std::size_t i = 0; i < lp.numElements(); i += 2) {
+        Listpack::Element element;
+        if (!lp.get(i, element)) return false;
+        if (!element.is_integer) longest = std::max(longest, element.string.size());
+    }
+
+    listpack_ = std::move(lp);
+    encoding_ = ObjEncoding::ListPack;
+
+    const EncodingLimits& limits = defaultLimits();
+    if (listpack_.numElements() / 2 > limits.zset_max_listpack_entries ||
+        longest > limits.zset_max_listpack_value) {
+        convertToSkipList();
+    }
+    return true;
 }
 
 bool ZSetValue::add(std::string_view member, double new_score) {
@@ -441,9 +509,22 @@ void ListValue::maybeConvert() {
             : ObjEncoding::QuickList;
 }
 
+bool ListValue::adoptNodes(std::vector<Listpack> nodes) {
+    std::size_t total = 0;
+    for (const Listpack& node : nodes) total += node.numElements();
+    if (total == 0) return false;
+
+    nodes_ = std::move(nodes);
+    maybeConvert();
+    return true;
+}
+
 // True when appending `value` would push `node` past the per-node byte budget.
-// The +11 covers the worst-case encoding header (5 bytes) and backlen (5), plus
-// a byte of slack, so a node never overshoots the limit.
+// The +11 is Redis's SIZE_ESTIMATE_OVERHEAD, and it has to be exactly that: the
+// check is deliberately an over-estimate, so a node fills to somewhat under the
+// limit rather than up to it. Projecting the true resulting size instead packs
+// one more element into some nodes, which moves every later node boundary and
+// makes the saved RDB stop matching a real server's byte for byte.
 static bool wouldOverflowNode(const Listpack& node, std::string_view value) {
     const std::size_t projected = node.totalBytes() + value.size() + 11;
     return node.numElements() > 0 && projected > defaultLimits().list_max_listpack_bytes;

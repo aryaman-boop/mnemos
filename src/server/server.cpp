@@ -89,7 +89,9 @@ Server::Server(Config config) : config_(std::move(config)) {
             notifyKeyspaceEvent(notify::kExpired, "expired", key, i);
         });
         databases_.back()->setNewKeyCallback([this, i](const std::string& key) {
-            notifyKeyspaceEvent(notify::kNew, "new", key, i);
+            // Loading an RDB fills the keyspace without any of it being news:
+            // Redis raises no events for keys that come off disk.
+            if (!loading_) notifyKeyspaceEvent(notify::kNew, "new", key, i);
         });
     }
     watched_keys_.resize(databases_.size());
@@ -136,7 +138,9 @@ bool Server::start() {
     loop_.addFd(listen_fd_, net::Ev::Read, [this](int, net::Ev) { onAcceptable(); });
     loop_.addTimer(std::chrono::milliseconds(kServerCronIntervalMs), [this] { serverCron(); });
 
-    start_time_ms_ = net::EventLoop::currentTimeMs();
+    start_time_ms_  = net::EventLoop::currentTimeMs();
+    last_save_time_ = start_time_ms_ / 1000;
+    if (!loadRdbAtStartup()) return false;
     std::printf("mnemos %s ready to accept connections on %s:%d\n", "0.1.0",
                 config_.bind_address.c_str(), config_.port);
     std::fflush(stdout);
@@ -630,6 +634,8 @@ void Server::closeClient(int fd) {
 
 void Server::serverCron() {
     const std::int64_t now = loop_.nowMs();
+
+    reapBackgroundSave();
 
     for (auto& database : databases_) {
         const int expired = database->activeExpireCycle(now);

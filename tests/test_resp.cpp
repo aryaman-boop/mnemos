@@ -127,7 +127,9 @@ void testReplyWriterResp2VsResp3() {
 
 void testDoubleFormatting() {
     CHECK_EQ(formatDouble(1.0), std::string("1"));
-    CHECK_EQ(formatDouble(-0.0), std::string("0"));
+    // A reply keeps the sign of a negative zero even though d2string, and so
+    // the text of a listpack-encoded score, does not.
+    CHECK_EQ(formatDouble(-0.0), std::string("-0"));
     CHECK_EQ(formatDouble(1.5), std::string("1.5"));
     CHECK_EQ(formatDouble(INFINITY), std::string("inf"));
     CHECK_EQ(formatDouble(-INFINITY), std::string("-inf"));

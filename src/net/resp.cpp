@@ -1,5 +1,7 @@
 #include "net/resp.h"
 
+#include "core/dtoa.h"
+
 #include <cctype>
 #include <charconv>
 #include <cmath>
@@ -346,21 +348,14 @@ void ReplyWriter::bulkArray(const std::vector<std::string>& items) {
     for (const std::string& s : items) bulk(s);
 }
 
-// Matches Redis's d2string(): integral values print without a decimal point, so
-// a ZSCORE of 1.0 comes back as "1" rather than "1.000000".
+// What a double looks like in a reply. This is d2string with one case taken
+// back: d2string routes a negative zero through its integer fast path and so
+// prints "0", but a reply keeps the sign, and `ZSCORE` on a skiplist-encoded
+// sorted set really does answer "-0". (A listpack-encoded one answers "0" --
+// the sign was already lost when d2string wrote the score into the listpack.)
 std::string formatDouble(double d) {
-    if (std::isnan(d)) return "nan";
-    if (std::isinf(d)) return d > 0 ? "inf" : "-inf";
-    if (d == 0.0)      return "0";  // also normalises -0.0
-
-    if (d == static_cast<double>(static_cast<long long>(d)) &&
-        std::abs(d) < 1e17) {
-        return std::to_string(static_cast<long long>(d));
-    }
-
-    char buf[64];
-    const int n = std::snprintf(buf, sizeof(buf), "%.17g", d);
-    return std::string(buf, static_cast<std::size_t>(n > 0 ? n : 0));
+    if (d == 0.0 && std::signbit(d)) return "-0";
+    return core::d2string(d);
 }
 
 // ---------------------------------------------------------------------------

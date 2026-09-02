@@ -8,6 +8,7 @@ PORT="${MNEMOS_TEST_PORT:-7399}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER="${ROOT}/build/mnemos-server"
 LOG="$(mktemp)"
+WORKDIR="$(mktemp -d)"
 
 pass=0
 fail=0
@@ -17,7 +18,13 @@ cleanup() {
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
+    if [[ -n "${RDB_PID:-}" ]] && kill -0 "$RDB_PID" 2>/dev/null; then
+        kill "$RDB_PID" 2>/dev/null || true
+        wait "$RDB_PID" 2>/dev/null || true
+    fi
+    [[ -n "${REF_PORT:-}" ]] && redis-cli -p "$REF_PORT" shutdown nosave 2>/dev/null
     rm -f "$LOG"
+    rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
 
@@ -52,7 +59,8 @@ check() {
     fi
 }
 
-"$SERVER" --port "$PORT" >"$LOG" 2>&1 &
+mkdir -p "${WORKDIR}/mnemos" "${WORKDIR}/redis"
+"$SERVER" --port "$PORT" --dir "${WORKDIR}/mnemos" >"$LOG" 2>&1 &
 SERVER_PID=$!
 
 # Wait for the listener rather than sleeping a fixed amount, so the suite is
@@ -147,6 +155,126 @@ say "== errors =="
 check "unknown command"       "ERR unknown command 'NOPE', with args beginning with: " NOPE
 check "wrong arity"           "ERR wrong number of arguments for 'get' command" GET
 check "SET bad option"        "ERR syntax error" SET k v BOGUS
+
+# --- RDB files, in both directions -------------------------------------------
+# The differential suite compares DUMP payloads, which is the same codec; this
+# is the other half of the claim, and the only test that hands a whole file to
+# the other implementation. Without redis-server there is nothing to hand it
+# to, so the section is skipped rather than failed.
+if command -v redis-server >/dev/null 2>&1; then
+    # Same assertion as `check`, against whichever server holds the file.
+    at() {
+        local port="$1" description="$2" expected="$3"; shift 3
+        local actual; actual="$(redis-cli -p "$port" "$@" 2>&1)"
+        if [[ "$actual" == "$expected" ]]; then
+            [[ "$QUIET" == "1" ]] || printf '  ok   %s\n' "$description"
+            pass=$((pass + 1))
+        else
+            printf '  FAIL %s\n       expected: %q\n         actual: %q\n' \
+                "$description" "$expected" "$actual"
+            fail=$((fail + 1))
+        fi
+    }
+    await() {
+        local port="$1"
+        for _ in $(seq 1 50); do
+            redis-cli -p "$port" PING >/dev/null 2>&1 && return 0
+            sleep 0.1
+        done
+        return 1
+    }
+
+    # Enough elements to force a quicklist of several nodes, which is the part
+    # of the format with the most room to be wrong.
+    BIG=()
+    for i in $(seq 1 400); do BIG+=("element-$i-padding-padding-padding-padding"); done
+    LZF="$(printf 'abcabcabc-%.0s' $(seq 1 40))"
+    # redis-cli prints an array one element per line when it is not a tty.
+    LIST="$(printf 'a\nb\nc\n1\n2\n3')"
+    BACKLIST="$(printf 'x\ny\nz')"
+
+    say
+    say "== rdb: a file mnemos wrote, opened by redis =="
+    REF_PORT=$((PORT + 1))
+    r FLUSHALL >/dev/null
+    r SET rdb_str hello >/dev/null
+    r SET rdb_int 12345 >/dev/null
+    r SET rdb_lzf "$LZF" >/dev/null
+    r RPUSH rdb_list a b c 1 2 3 >/dev/null
+    r RPUSH rdb_big "${BIG[@]}" >/dev/null
+    r SADD rdb_intset 1 2 3 >/dev/null
+    r SADD rdb_set a b c >/dev/null
+    r HSET rdb_hash f1 v1 f2 v2 >/dev/null
+    r ZADD rdb_zset 1 a 2.5 b >/dev/null
+    r SET rdb_ttl v >/dev/null
+    r EXPIRE rdb_ttl 10000 >/dev/null
+    r SAVE >/dev/null
+
+    redis-server --port "$REF_PORT" --dir "${WORKDIR}/mnemos" --appendonly no \
+        --save '' --daemonize yes >/dev/null 2>&1
+    if await "$REF_PORT"; then
+        at "$REF_PORT" "redis loaded the file"  "10"        DBSIZE
+        at "$REF_PORT" "string survived"        "hello"     GET rdb_str
+        at "$REF_PORT" "int encoding survived"  "int"       OBJECT ENCODING rdb_int
+        at "$REF_PORT" "lzf string survived"    "$LZF"      GET rdb_lzf
+        at "$REF_PORT" "list survived"          "$LIST"     LRANGE rdb_list 0 -1
+        at "$REF_PORT" "quicklist survived"     "400"       LLEN rdb_big
+        at "$REF_PORT" "quicklist encoding"     "quicklist" OBJECT ENCODING rdb_big
+        at "$REF_PORT" "last element intact"    "${BIG[399]}" LINDEX rdb_big -1
+        at "$REF_PORT" "intset encoding"        "intset"    OBJECT ENCODING rdb_intset
+        at "$REF_PORT" "listpack set encoding"  "listpack"  OBJECT ENCODING rdb_set
+        at "$REF_PORT" "hash survived"          "v2"        HGET rdb_hash f2
+        at "$REF_PORT" "zset survived"          "2.5"       ZSCORE rdb_zset b
+        at "$REF_PORT" "ttl survived"           "1"         PERSIST rdb_ttl
+
+        say
+        say "== rdb: a file redis wrote, opened by mnemos =="
+        # `dir` is a protected config from redis 7 on, so the other direction
+        # gets its own server started in the right directory rather than a
+        # CONFIG SET that would be refused.
+        redis-cli -p "$REF_PORT" shutdown nosave 2>/dev/null
+        redis-server --port "$REF_PORT" --dir "${WORKDIR}/redis" --appendonly no \
+            --save '' --daemonize yes >/dev/null 2>&1
+        await "$REF_PORT"
+        redis-cli -p "$REF_PORT" SET back_str world >/dev/null
+        redis-cli -p "$REF_PORT" SET back_lzf "$LZF" >/dev/null
+        redis-cli -p "$REF_PORT" RPUSH back_list x y z >/dev/null
+        redis-cli -p "$REF_PORT" RPUSH back_big "${BIG[@]}" >/dev/null
+        redis-cli -p "$REF_PORT" SADD back_intset 7 8 9 >/dev/null
+        redis-cli -p "$REF_PORT" HSET back_hash f v >/dev/null
+        redis-cli -p "$REF_PORT" ZADD back_zset 1.5 a >/dev/null
+        redis-cli -p "$REF_PORT" SET back_ttl v >/dev/null
+        redis-cli -p "$REF_PORT" EXPIRE back_ttl 10000 >/dev/null
+        redis-cli -p "$REF_PORT" SAVE >/dev/null
+        redis-cli -p "$REF_PORT" shutdown nosave 2>/dev/null
+        REF_PORT=""
+
+        # A second mnemos, pointed at the directory redis just wrote into.
+        # Loading at startup is the only path that reads a file nothing in this
+        # process produced.
+        RDB_PORT=$((PORT + 2))
+        "$SERVER" --port "$RDB_PORT" --dir "${WORKDIR}/redis" >>"$LOG" 2>&1 &
+        RDB_PID=$!
+        if await "$RDB_PORT"; then
+            at "$RDB_PORT" "mnemos loaded the file" "8"        DBSIZE
+            at "$RDB_PORT" "string survived"        "world"    GET back_str
+            at "$RDB_PORT" "lzf string survived"    "$LZF"     GET back_lzf
+            at "$RDB_PORT" "list survived"          "$BACKLIST" LRANGE back_list 0 -1
+            at "$RDB_PORT" "quicklist survived"     "400"      LLEN back_big
+            at "$RDB_PORT" "quicklist encoding"     "quicklist" OBJECT ENCODING back_big
+            at "$RDB_PORT" "last element intact"    "${BIG[399]}" LINDEX back_big -1
+            at "$RDB_PORT" "intset encoding"        "intset"   OBJECT ENCODING back_intset
+            at "$RDB_PORT" "hash survived"          "v"        HGET back_hash f
+            at "$RDB_PORT" "zset survived"          "1.5"      ZSCORE back_zset a
+            at "$RDB_PORT" "ttl survived"           "1"        PERSIST back_ttl
+        else
+            printf '  FAIL mnemos did not start on the redis-written file\n'
+            fail=$((fail + 1))
+        fi
+    else
+        say "  (skipped: redis-server would not start on the mnemos file)"
+    fi
+fi
 
 echo
 echo "passed: $pass   failed: $fail"

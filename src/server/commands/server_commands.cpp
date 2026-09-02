@@ -115,7 +115,12 @@ std::string buildInfo(Server& server, const std::string& section) {
         out += "# Persistence\r\n";
         out += "loading:0\r\n";
         out += "rdb_changes_since_last_save:" + std::to_string(server.dirty()) + "\r\n";
-        out += "rdb_bgsave_in_progress:0\r\n";
+        out += "rdb_bgsave_in_progress:" +
+               std::string(server.bgsaveInProgress() ? "1" : "0") + "\r\n";
+        out += "rdb_last_save_time:" + std::to_string(server.lastSaveTime()) + "\r\n";
+        out += "rdb_last_bgsave_status:" +
+               std::string(server.lastBgsaveOk() ? "ok" : "err") + "\r\n";
+        out += "rdb_saves:" + std::to_string(server.rdbSaves()) + "\r\n";
         out += "aof_enabled:0\r\n";
         out += "\r\n";
     }
@@ -379,6 +384,18 @@ void debug(CommandContext& ctx) {
         replies::ok(ctx.reply);
         return;
     }
+    if (sub == "RELOAD") {
+        // The one command whose whole job is to assert that a save and a load
+        // are inverses: the keyspace after it must be indistinguishable from
+        // the keyspace before, encodings and TTLs included.
+        std::string error;
+        if (!ctx.server.reloadRdb(error)) {
+            ctx.reply.error("ERR " + error);
+            return;
+        }
+        replies::ok(ctx.reply);
+        return;
+    }
     if (sub == "OBJECT") {
         if (ctx.argc() != 3) {
             replies::wrongArgs(ctx.reply, "debug|object");
@@ -421,13 +438,22 @@ void time(CommandContext& ctx) {
 }
 
 void lastsave(CommandContext& ctx) {
-    ctx.reply.integer(ctx.server.startTimeMs() / 1000);
+    ctx.reply.integer(ctx.server.lastSaveTime());
 }
 
 void shutdown(CommandContext& ctx) {
     if (ctx.argc() > 1 && equalsIgnoreCase(ctx.arg(1), "ABORT")) {
         ctx.reply.error("ERR No shutdown in progress");
         return;
+    }
+    // SAVE forces a snapshot, NOSAVE forbids one; with neither, a save happens
+    // only if the configuration asks for one, and mnemos has no save points.
+    if (ctx.argc() > 1 && equalsIgnoreCase(ctx.arg(1), "SAVE")) {
+        std::string error;
+        if (!ctx.server.saveRdb(error)) {
+            ctx.reply.error("ERR Errors trying to SHUTDOWN. Check logs.");
+            return;
+        }
     }
     // No reply on success: the connection simply dies with the server, which is
     // what clients expect from SHUTDOWN.

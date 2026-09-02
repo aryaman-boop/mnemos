@@ -87,6 +87,16 @@ void subcommandSyntaxError(net::ReplyWriter& w, std::string_view container,
 // instead, and that wrapper supplies the code itself.
 std::string wrongArgsText(std::string_view command);
 std::string subscriberModeText(std::string_view command);
+// RESTORE's four refusals. The distinction between the first two is Redis's and
+// it matters: a footer that does not check out is a payload from the wrong
+// server or a corrupted one, while a body that does not parse is a payload this
+// version cannot read.
+void badDumpPayload(net::ReplyWriter& w);
+void badDataFormat(net::ReplyWriter& w);
+void busyKey(net::ReplyWriter& w);
+void invalidRestoreTtl(net::ReplyWriter& w);
+void invalidIdletime(net::ReplyWriter& w);
+void invalidFreq(net::ReplyWriter& w);
 }  // namespace replies
 
 }  // namespace mnemos::server
