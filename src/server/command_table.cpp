@@ -29,6 +29,14 @@ const std::vector<CommandSpec>& table() {
         {"reset",         cmd::reset,               1,  kFast | kNoAuth | kLoading,   0,  0,  0},
         {"client",        cmd::client,             -2,  kAdmin | kNoAuth | kLoading,  0,  0,  0},
 
+        // Transactions. All five run rather than queue when the client is
+        // already inside MULTI -- see Server::dispatch.
+        {"multi",         cmd::multi,               1,  kFast | kLoading,             0,  0,  0},
+        {"exec",          cmd::exec,                1,  kLoading,                     0,  0,  0},
+        {"discard",       cmd::discard,             1,  kFast | kLoading,             0,  0,  0},
+        {"watch",         cmd::watch,              -2,  kFast | kLoading,             1, -1,  1},
+        {"unwatch",       cmd::unwatch,             1,  kFast | kLoading,             0,  0,  0},
+
         // Global pub/sub carries no keys, so first/last/step stay zero -- the
         // channel name is not a keyspace key and must not be routed as one.
         {"subscribe",     cmd::subscribe,          -2,  kFast | kLoading,             0,  0,  0},
@@ -214,12 +222,24 @@ void notAnInteger(net::ReplyWriter& w) {
 void notAFloat(net::ReplyWriter& w) { w.error("ERR value is not a valid float"); }
 void outOfRange(net::ReplyWriter& w) { w.error("ERR value is out of range"); }
 void wrongArgs(net::ReplyWriter& w, std::string_view command) {
-    std::string msg = "ERR wrong number of arguments for '";
-    msg.append(command);
-    msg.append("' command");
-    w.error(msg);
+    w.error("ERR " + wrongArgsText(command));
 }
 void ok(net::ReplyWriter& w) { w.simpleString("OK"); }
+
+std::string wrongArgsText(std::string_view command) {
+    std::string msg = "wrong number of arguments for '";
+    msg.append(command);
+    msg.append("' command");
+    return msg;
+}
+
+std::string subscriberModeText(std::string_view command) {
+    std::string msg = "Can't execute '";
+    msg.append(command);
+    msg.append("': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / "
+               "RESET are allowed in this context");
+    return msg;
+}
 
 void unknownSubcommand(net::ReplyWriter& w, std::string_view container,
                        std::string_view sub) {

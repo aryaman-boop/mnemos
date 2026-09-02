@@ -156,4 +156,11 @@ void zpopmin(CommandContext&);
 void zpopmax(CommandContext&);
 void zrandmember(CommandContext&);
 
+// --- transaction_commands.cpp ---
+void multi(CommandContext&);
+void exec(CommandContext&);
+void discard(CommandContext&);
+void watch(CommandContext&);
+void unwatch(CommandContext&);
+
 }  // namespace mnemos::server::cmd

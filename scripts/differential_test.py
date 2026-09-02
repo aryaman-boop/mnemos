@@ -681,6 +681,157 @@ SUITES = [
         (1, "PUNSUBSCRIBE"),
         (0, "CONFIG", "SET", "notify-keyspace-events", ""),
     ], {"two_clients": True}),
+    ("transactions: queue, exec, and the empty one", [
+        ("DEL", "t1", "t2", "t3"),
+        ("MULTI",),
+        ("SET", "t1", "v"),
+        ("INCR", "t2"),
+        ("RPUSH", "t3", "a", "b"),
+        ("EXEC",),
+        ("GET", "t1"), ("GET", "t2"), ("LRANGE", "t3", "0", "-1"),
+        ("MULTI",), ("EXEC",),          # nothing queued is an empty array
+        ("DEL", "t1", "t2", "t3"),
+    ], {}),
+    ("transactions: discard, and a nested MULTI", [
+        ("DEL", "td"),
+        ("MULTI",), ("SET", "td", "v"), ("DISCARD",), ("EXISTS", "td"),
+        ("EXEC",),                      # EXEC without MULTI
+        ("DISCARD",),                   # DISCARD without MULTI
+        # A second MULTI is an error but not an abort: the transaction the first
+        # one opened is still there, and still runs.
+        ("MULTI",), ("MULTI",), ("SET", "td", "2"), ("EXEC",), ("GET", "td"),
+        ("DEL", "td"),
+    ], {}),
+    ("transactions: a command that cannot be queued aborts the lot", [
+        ("DEL", "ta"),
+        ("MULTI",),
+        ("SET", "ta", "v"),
+        ("NOSUCHCOMMAND", "x"),         # unknown -- rejected, and remembered
+        ("GET",),                       # wrong arity -- likewise
+        ("EXEC",),
+        ("EXISTS", "ta"),               # the queued SET never ran
+        ("MULTI",), ("SET", "ta", "v"), ("EXEC",), ("GET", "ta"),
+        ("DEL", "ta"),
+    ], {}),
+    ("transactions: an error inside EXEC is one element of the reply", [
+        ("DEL", "te"), ("SET", "te", "s"),
+        # Queued fine, each of them: nothing here is wrong until it runs, and
+        # the ones after the failures still run.
+        ("MULTI",), ("INCR", "te"), ("LPUSH", "te", "x"), ("APPEND", "te", "!"),
+        ("EXEC",),
+        ("GET", "te"),
+        ("DEL", "te"),
+    ], {}),
+    ("transactions: SELECT inside EXEC", [
+        ("SELECT", "9"), ("DEL", "ts"), ("SELECT", "0"), ("DEL", "ts"),
+        ("MULTI",),
+        ("SELECT", "9"), ("SET", "ts", "in9"), ("SELECT", "0"), ("GET", "ts"),
+        ("EXEC",),
+        ("GET", "ts"),                  # db 0, where nothing was written
+        ("SELECT", "9"), ("GET", "ts"), ("DEL", "ts"), ("SELECT", "0"),
+    ], {}),
+    ("transactions: WATCH inside MULTI", [
+        ("DEL", "wm"),
+        # Refused, because a watch added here could only guard reads the client
+        # has not made yet -- but refused as an error, not as an abort.
+        ("MULTI",), ("WATCH", "wm"), ("SET", "wm", "v"), ("EXEC",),
+        ("GET", "wm"), ("DEL", "wm"),
+    ], {}),
+    ("transactions: arity, and EXEC's own rejection", [
+        ("MULTI", "x"), ("DISCARD", "x"), ("UNWATCH", "x"), ("WATCH",),
+        # Rejecting EXEC is aborting a transaction, so even the arity error
+        # comes back wearing EXECABORT.
+        ("EXEC", "x"),
+        ("MULTI",), ("EXEC", "x"), ("EXEC",),   # ... and it really did discard
+    ], {}),
+    ("transactions: a watch another client dirties", [
+        (0, "DEL", "w1"),
+        (0, "WATCH", "w1"),
+        (1, "SET", "w1", "other"),
+        (0, "MULTI"), (0, "SET", "w1", "mine"), (0, "EXEC"),
+        (0, "GET", "w1"),               # still the other client's value
+        (0, "DEL", "w1"),
+    ], {"two_clients": True}),
+    ("transactions: a watch that holds", [
+        (0, "DEL", "w2", "w3"),
+        (0, "WATCH", "w2"),
+        (1, "SET", "w3", "other"),      # a key nobody is watching
+        (0, "MULTI"), (0, "SET", "w2", "mine"), (0, "EXEC"),
+        (0, "GET", "w2"),
+        (0, "DEL", "w2", "w3"),
+    ], {"two_clients": True}),
+    ("transactions: the client's own write dirties its watch", [
+        (0, "DEL", "w5"),
+        (0, "WATCH", "w5"),
+        (0, "SET", "w5", "self"),
+        (0, "MULTI"), (0, "GET", "w5"), (0, "EXEC"),
+        (0, "DEL", "w5"),
+    ], {"two_clients": True}),
+    ("transactions: what clears a watch", [
+        (0, "DEL", "w4"),
+        (0, "WATCH", "w4"), (0, "UNWATCH"),
+        (1, "SET", "w4", "one"),
+        (0, "MULTI"), (0, "GET", "w4"), (0, "EXEC"),
+        # UNWATCH after the damage is done clears the verdict too
+        (0, "WATCH", "w4"),
+        (1, "SET", "w4", "two"),
+        (0, "UNWATCH"),
+        (0, "MULTI"), (0, "GET", "w4"), (0, "EXEC"),
+        # DISCARD unwatches
+        (0, "WATCH", "w4"), (0, "MULTI"), (0, "DISCARD"),
+        (1, "SET", "w4", "three"),
+        (0, "MULTI"), (0, "GET", "w4"), (0, "EXEC"),
+        # and so does a transaction that ran
+        (0, "WATCH", "w4"), (0, "MULTI"), (0, "PING"), (0, "EXEC"),
+        (1, "SET", "w4", "four"),
+        (0, "MULTI"), (0, "GET", "w4"), (0, "EXEC"),
+        (0, "DEL", "w4"),
+    ], {"two_clients": True}),
+    ("transactions: watches are per database", [
+        (0, "DEL", "w6"),
+        (0, "WATCH", "w6"),
+        (1, "SELECT", "9"), (1, "SET", "w6", "elsewhere"), (1, "DEL", "w6"),
+        (1, "SELECT", "0"),
+        (0, "MULTI"), (0, "SET", "w6", "mine"), (0, "EXEC"),
+        (0, "GET", "w6"),
+        (0, "DEL", "w6"),
+    ], {"two_clients": True}),
+    ("transactions: FLUSHDB dirties only the keys that were there", [
+        (0, "SELECT", "9"), (1, "SELECT", "9"), (0, "FLUSHDB"),
+        (0, "SET", "w7", "v"),
+        (0, "WATCH", "w7"),
+        (1, "FLUSHDB"),
+        (0, "MULTI"), (0, "PING"), (0, "EXEC"),
+        # A key the database never held cannot have been changed by emptying it.
+        (0, "WATCH", "ghost"),
+        (1, "FLUSHDB"),
+        (0, "MULTI"), (0, "PING"), (0, "EXEC"),
+        (0, "SELECT", "0"), (1, "SELECT", "0"),
+    ], {"two_clients": True}),
+    ("transactions: a key that expires under the watch", [
+        (0, "DEL", "w8", "w9"),
+        (0, "SET", "w8", "v", "PX", "100"),
+        (0, "WATCH", "w8"),
+        (0, "@sleep", "0.5"),
+        (0, "MULTI"), (0, "PING"), (0, "EXEC"),
+        # Watching a key that is already gone is not the same thing: its
+        # deletion is not news to a client that never saw it alive.
+        (0, "SET", "w9", "v", "PX", "100"),
+        (0, "@sleep", "0.5"),
+        (0, "WATCH", "w9"),
+        (0, "MULTI"), (0, "PING"), (0, "EXEC"),
+        (0, "DEL", "w8", "w9"),
+    ], {"two_clients": True}),
+    ("transactions: events raised inside EXEC arrive after it", [
+        (0, "DEL", "tn"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", "KEA"),
+        (1, "SUBSCRIBE", "__keyevent@0__:set"),
+        (0, "MULTI"), (0, "SET", "tn", "1"), (0, "SET", "tn", "2"), (0, "EXEC"),
+        (1, "@recv"), (1, "@recv"),
+        (1, "UNSUBSCRIBE", "__keyevent@0__:set"),
+        (0, "CONFIG", "SET", "notify-keyspace-events", ""),
+        (0, "DEL", "tn"),
+    ], {"two_clients": True}),
     ("keyspace: the client that caused the event is told too", [
         ("@hello3",),
         ("DEL", "kself"),
@@ -711,6 +862,16 @@ SUITES = [
         ("LPUSH",), ("HSET", "k"), ("ZADD", "k", "1"),
         ("LRANGE", "k", "a", "b"), ("ZADD", "k", "notanumber", "m"),
         ("SINTERCARD", "0", "k"), ("LPOP", "k", "-1"),
+    ], {}),
+    ("transactions: RESP3 replies", [
+        ("@hello3",),
+        ("DEL", "r3"),
+        ("MULTI",), ("SET", "r3", "v"), ("GET", "r3"), ("EXEC",),
+        ("MULTI",), ("EXEC",),
+        # The abort is a null, which RESP3 frames as _ rather than as *-1.
+        ("WATCH", "r3"), ("SET", "r3", "x"),
+        ("MULTI",), ("GET", "r3"), ("EXEC",),
+        ("DEL", "r3"),
     ], {}),
 ]
 

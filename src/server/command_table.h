@@ -81,6 +81,12 @@ void unknownSubcommand(net::ReplyWriter& w, std::string_view container,
                        std::string_view sub);
 void subcommandSyntaxError(net::ReplyWriter& w, std::string_view container,
                            std::string_view sub);
+// The same two messages as bare text, without the error code in front. A
+// command rejected before it runs is normally reported as an error -- but when
+// the rejected command is EXEC, the refusal is folded into an EXECABORT
+// instead, and that wrapper supplies the code itself.
+std::string wrongArgsText(std::string_view command);
+std::string subscriberModeText(std::string_view command);
 }  // namespace replies
 
 }  // namespace mnemos::server

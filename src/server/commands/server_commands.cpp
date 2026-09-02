@@ -143,6 +143,9 @@ void dbsize(CommandContext& ctx) {
 
 void flushdb(CommandContext& ctx) {
     // ASYNC / SYNC are accepted and ignored: we free inline, so both are honest.
+    // Emptying a database raises no keyspace event, so the watchers of the keys
+    // about to disappear have to be told here instead.
+    ctx.server.touchWatchedKeysOnFlush(ctx.db.index());
     ctx.db.flush();
     ctx.server.markDirty();
     replies::ok(ctx.reply);
@@ -150,6 +153,7 @@ void flushdb(CommandContext& ctx) {
 
 void flushall(CommandContext& ctx) {
     for (std::size_t i = 0; i < ctx.server.databaseCount(); ++i) {
+        ctx.server.touchWatchedKeysOnFlush(static_cast<int>(i));
         ctx.server.db(static_cast<int>(i)).flush();
     }
     ctx.server.markDirty();

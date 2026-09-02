@@ -34,6 +34,14 @@ bool isAllowedInSubscriberMode(std::string_view name) {
            name == "ping" || name == "quit" || name == "reset";
 }
 
+// Commands that steer a transaction rather than belonging to one, so they run
+// immediately instead of being queued. QUIT is in the list for a blunter
+// reason: a connection has to be able to end mid-transaction.
+bool isTransactionControl(std::string_view name) {
+    return name == "multi" || name == "exec" || name == "discard" ||
+           name == "watch" || name == "quit" || name == "reset";
+}
+
 bool setNonBlocking(int fd) {
     const int flags = ::fcntl(fd, F_GETFL, 0);
     return flags != -1 && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
@@ -84,6 +92,7 @@ Server::Server(Config config) : config_(std::move(config)) {
             notifyKeyspaceEvent(notify::kNew, "new", key, i);
         });
     }
+    watched_keys_.resize(databases_.size());
     run_id_ = generateRunId();
 }
 
@@ -267,6 +276,24 @@ void Server::dispatch(Client& client, std::vector<std::string>& argv) {
     net::ReplyWriter writer(client.outputBuffer(), client.protocolVersion());
 
     const CommandSpec* spec = lookupCommand(argv[0]);
+
+    // Every rejection below shares a consequence: a client inside MULTI has now
+    // sent a command that will never run, so its EXEC must refuse the whole
+    // queue. Redis flags that here, at the point the bad command arrived,
+    // rather than discovering it at EXEC.
+    const auto reject = [&](std::string_view code, const std::string& text) {
+        if (client.inMulti()) client.flagMultiError();
+        // Rejecting EXEC *is* aborting the transaction, so the refusal takes
+        // the shape of an abort rather than the shape of an error -- which is
+        // why `EXEC x` reports EXECABORT and not a plain arity error.
+        if (spec && spec->name == "exec") {
+            discardTransaction(client);
+            writer.error("EXECABORT Transaction discarded because of: " + text);
+            return;
+        }
+        writer.error(std::string(code) + " " + text);
+    };
+
     if (!spec) {
         // Redis echoes the command *as the client spelled it*, then quotes the
         // leading arguments until roughly 128 bytes have been emitted. Matching
@@ -277,21 +304,21 @@ void Server::dispatch(Client& client, std::vector<std::string>& argv) {
             args.append(argv[i], 0, kUnknownCommandArgsLimit - args.size());
             args += "' ";
         }
-        writer.error("ERR unknown command '" + argv[0] +
-                     "', with args beginning with: " + args);
+        reject("ERR", "unknown command '" + argv[0] +
+                          "', with args beginning with: " + args);
         return;
     }
 
     if (!arityOk(*spec, argv.size())) {
         // The canonical (lower-case) name is used here, not the client's
         // spelling -- `GeT` and `get` both report "'get'".
-        replies::wrongArgs(writer, spec->name);
+        reject("ERR", replies::wrongArgsText(spec->name));
         return;
     }
 
     if (!config_.requirepass.empty() && !client.authenticated() &&
         !(spec->flags & flags::kNoAuth)) {
-        writer.error("NOAUTH Authentication required.");
+        reject("NOAUTH", "Authentication required.");
         return;
     }
 
@@ -304,14 +331,37 @@ void Server::dispatch(Client& client, std::vector<std::string>& argv) {
         if ((spec->flags & flags::kContainer) && argv.size() > 1) {
             named += "|" + core::toLower(argv[1]);
         }
-        writer.error("ERR Can't execute '" + named +
-                     "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / "
-                     "RESET are allowed in this context");
+        reject("ERR", replies::subscriberModeText(named));
         return;
     }
 
-    client.setLastCommand(std::string(spec->name));
+    // Past every check a command has to pass, and inside a transaction: hold it
+    // instead of running it. Nothing is validated beyond this point at EXEC
+    // time, which is exactly why the checks above have to happen now.
+    if (client.inMulti() && !isTransactionControl(spec->name)) {
+        client.queueCommand(argv);
+        writer.simpleString("QUEUED");
+        return;
+    }
 
+    callCommand(client, *spec, argv, writer);
+
+    // After the whole command, and so after every command of a transaction: a
+    // message the client caused itself arrives behind the reply, never inside
+    // the array EXEC is still building.
+    if (!self_pending_.empty()) {
+        client.outputBuffer().append(self_pending_);
+        self_pending_.clear();
+    }
+}
+
+void Server::callCommand(Client& client, const CommandSpec& spec,
+                         const std::vector<std::string>& argv,
+                         net::ReplyWriter& writer) {
+    client.setLastCommand(std::string(spec.name));
+
+    // Resolved per call rather than once: SELECT inside a transaction moves the
+    // commands that follow it to another database, as it does outside one.
     CommandContext ctx{
         .server = *this,
         .client = client,
@@ -322,13 +372,8 @@ void Server::dispatch(Client& client, std::vector<std::string>& argv) {
 
     const int previous_executing = executing_fd_;
     executing_fd_ = client.fd();
-    spec->handler(ctx);
+    spec.handler(ctx);
     executing_fd_ = previous_executing;
-
-    if (!self_pending_.empty()) {
-        client.outputBuffer().append(self_pending_);
-        self_pending_.clear();
-    }
 
     ++stats_.commands_processed;
 }
@@ -452,6 +497,16 @@ std::int64_t Server::publishShardMessage(const std::string& channel,
 
 void Server::notifyKeyspaceEvent(std::uint32_t event_class, std::string_view event,
                                  const std::string& key, int db_index) {
+    // Every mutation in the server already passes through here, which makes
+    // this the one place a WATCH needs to be invalidated from: the set of
+    // changes worth announcing and the set a transaction can lose a race to are
+    // the same set. It is signalled before the enabled check below -- whether
+    // anyone asked to be *told* about the change has no bearing on whether the
+    // change happened.
+    if (event_class != notify::kKeyMiss) {
+        signalModifiedKey(db_index, key, event == "expired");
+    }
+
     const std::uint32_t enabled = config_.notify_flags;
     if (!(enabled & event_class)) return;
 
@@ -464,6 +519,76 @@ void Server::notifyKeyspaceEvent(std::uint32_t event_class, std::string_view eve
     if (enabled & notify::kKeyevent) {
         publishMessage("__keyevent@" + db + "__:" + std::string(event), key);
     }
+}
+
+void Server::watchKey(Client& client, const std::string& key) {
+    const int db_index = client.dbIndex();
+    for (const Client::WatchedKey& watched : client.watchedKeys()) {
+        // WATCH is idempotent: watching the same key twice is one watch, and
+        // one UNWATCH has to be enough to undo it.
+        if (watched.db == db_index && watched.key == key) return;
+    }
+    const std::int64_t expires_at = db(db_index).expireAtMs(key);
+    client.watchedKeys().push_back(
+        {db_index, key, expires_at >= 0 && expires_at <= nowMs()});
+    watched_keys_[static_cast<std::size_t>(db_index)][key].insert(client.fd());
+}
+
+void Server::unwatchAllKeys(Client& client) {
+    for (const Client::WatchedKey& watched : client.watchedKeys()) {
+        auto& keys = watched_keys_[static_cast<std::size_t>(watched.db)];
+        const auto it = keys.find(watched.key);
+        if (it == keys.end()) continue;
+        it->second.erase(client.fd());
+        // The map is expected to be empty on almost every server, so an entry
+        // nobody watches any more is removed rather than left behind.
+        if (it->second.empty()) keys.erase(it);
+    }
+    client.watchedKeys().clear();
+}
+
+void Server::discardTransaction(Client& client) {
+    client.resetMultiState();
+    unwatchAllKeys(client);
+}
+
+void Server::signalModifiedKey(int db_index, const std::string& key, bool from_expiry) {
+    auto& keys = watched_keys_[static_cast<std::size_t>(db_index)];
+    const auto it = keys.find(key);
+    if (it == keys.end()) return;
+
+    for (const int fd : it->second) {
+        Client* watcher = clientByFd(fd);
+        if (!watcher) continue;
+        if (from_expiry) {
+            // The key died of a TTL it already had when this client watched it.
+            // Nothing the client could observe has changed -- it read the key as
+            // gone then and reads it as gone now -- so the watch survives, but
+            // only once: a second deletion would be a real change.
+            bool seen_expired = false;
+            for (Client::WatchedKey& watched : watcher->watchedKeys()) {
+                if (watched.db == db_index && watched.key == key && watched.expired) {
+                    watched.expired = false;
+                    seen_expired    = true;
+                }
+            }
+            if (seen_expired) continue;
+        }
+        watcher->setDirtyCas();
+    }
+}
+
+void Server::touchWatchedKeysOnFlush(int db_index) {
+    Database& database = db(db_index);
+    // Collected first: signalling walks the same map, and a key that is not
+    // there is not a change -- watching a key in a database that never held it
+    // survives that database being emptied.
+    std::vector<std::string> present;
+    for (const auto& [key, watchers] : watched_keys_[static_cast<std::size_t>(db_index)]) {
+        (void)watchers;
+        if (database.raw().find(key) != nullptr) present.push_back(key);
+    }
+    for (const std::string& key : present) signalModifiedKey(db_index, key, false);
 }
 
 void Server::clearSubscriptions(Client& client) {
@@ -488,6 +613,7 @@ void Server::closeClient(int fd) {
     // Done before the deferred-close branch below: a connection on its way out
     // must stop receiving messages immediately, not once the loop unwinds.
     clearSubscriptions(*it->second);
+    unwatchAllKeys(*it->second);
 
     if (fd == executing_fd_) {
         // We are inside this client's own command handler; tearing the object

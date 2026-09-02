@@ -113,10 +113,36 @@ directly. Four rules, all of them checked by the differential suites:
   against *that* client's protocol version (`Server::queueWrite`, and pub/sub
   delivery for the worked example). RESP2 and RESP3 frame pushes differently.
 
+## Transactions
+
+`MULTI` queues; `EXEC` runs the queue back to back on the one thread, which is
+the whole of the atomicity. There is no rollback, so a command that fails inside
+`EXEC` fails alone and the rest still run.
+
+- Validation happens at *queue* time, not at `EXEC` time. `Server::dispatch`
+  checks arity, auth and subscriber mode before deciding to queue, and its
+  `reject()` lambda flags the transaction so `EXEC` refuses the lot with
+  `EXECABORT`. `EXEC` then calls handlers directly through `Server::callCommand`
+  — no second round of checks.
+- Rejecting `EXEC` *itself* is an abort, not an error: `EXEC x` reports
+  `EXECABORT Transaction discarded because of: <bare message>`. That is what the
+  `…Text` helpers in `namespace replies` exist for.
+- A handler's own error (a nested `MULTI`, `WATCH` inside `MULTI`) does *not*
+  abort the transaction. Only a command that failed to queue does.
+- `WATCH` is invalidated from `Server::notifyKeyspaceEvent`, before its enabled
+  check — every mutation already funnels through there, so the set of things
+  worth announcing and the set a transaction can lose a race to are one set. The
+  two paths that bypass it announce themselves: `FLUSHDB`/`FLUSHALL` call
+  `touchWatchedKeysOnFlush` (only for keys actually present), and disconnect and
+  `RESET` call `unwatchAllKeys`.
+- A key already past its TTL when it was watched records `expired`, and the lazy
+  delete that follows is not counted as a change — the watcher had already seen
+  it as gone.
+
 ## Not yet implemented
 
-`MULTI`/`EXEC`/`WATCH`, RDB persistence
-(real format), AOF with rewrite, replication over `PSYNC`, the MCP server.
+RDB persistence (real format), AOF with rewrite, replication over `PSYNC`,
+the MCP server.
 Unimplemented commands return an unknown-command error rather than a stub.
 
 ## Working agreement

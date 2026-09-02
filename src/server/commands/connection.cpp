@@ -127,6 +127,7 @@ void quit(CommandContext& ctx) {
 
 void reset(CommandContext& ctx) {
     ctx.server.clearSubscriptions(ctx.client);
+    ctx.server.discardTransaction(ctx.client);
     ctx.client.setDbIndex(0);
     ctx.client.setProtocolVersion(2);
     ctx.client.setName("");

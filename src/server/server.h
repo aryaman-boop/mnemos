@@ -11,6 +11,7 @@
 
 #include "net/event_loop.h"
 #include "net/resp.h"
+#include "server/command_table.h"
 #include "server/db.h"
 #include "server/notify.h"
 #include "server/pubsub.h"
@@ -96,6 +97,46 @@ public:
         return subscriptionCount() + shard_channels_.size() > 0;
     }
 
+    // MULTI state. The queue belongs to the connection, not to the server:
+    // two clients can be mid-transaction at the same time with nothing shared
+    // between them, because nothing is executed until one of them says EXEC.
+    bool inMulti() const { return in_multi_; }
+    void beginMulti() { in_multi_ = true; }
+    void queueCommand(std::vector<std::string> argv) {
+        multi_queue_.push_back(std::move(argv));
+    }
+    std::vector<std::vector<std::string>>& multiQueue() { return multi_queue_; }
+    // A command that could not even be queued -- unknown, or called with the
+    // wrong number of arguments. EXEC then refuses to run any of the queue.
+    void flagMultiError() { multi_error_ = true; }
+    bool multiError() const { return multi_error_; }
+    // Everything MULTI set up, undone. The watches go too, but they live in the
+    // server's index as well, so Server::discardTransaction is what to call.
+    void resetMultiState() {
+        in_multi_    = false;
+        multi_error_ = false;
+        dirty_cas_   = false;
+        multi_queue_.clear();
+    }
+
+    // One WATCHed key. The database is recorded because a watch outlives the
+    // SELECT that was in force when it was made: watching `k` in db 1 is not
+    // invalidated by someone writing `k` in db 0.
+    struct WatchedKey {
+        int         db;
+        std::string key;
+        // Whether the key was already past its TTL when WATCH ran. The lazy
+        // delete that happens the next time anyone looks at it is then not a
+        // change this client can observe -- it already saw the key as gone.
+        bool        expired;
+    };
+    std::vector<WatchedKey>& watchedKeys() { return watched_keys_; }
+    bool dirtyCas() const { return dirty_cas_; }
+    void setDirtyCas() { dirty_cas_ = true; }
+    // UNWATCH clears the flag as well as the watches: a client that gives up on
+    // its old assumptions is not still failing because of them.
+    void clearDirtyCas() { dirty_cas_ = false; }
+
     // Discards the already-parsed prefix of the query buffer. Called once per
     // read cycle rather than per command, so a pipeline of N commands costs one
     // memmove instead of N.
@@ -117,6 +158,12 @@ private:
 
     std::string         output_buffer_;
     std::size_t         output_sent_ = 0;
+
+    bool                                  in_multi_    = false;
+    bool                                  multi_error_ = false;
+    bool                                  dirty_cas_   = false;
+    std::vector<std::vector<std::string>> multi_queue_;
+    std::vector<WatchedKey>               watched_keys_;
 
     std::set<std::string> channels_;
     std::set<std::string> patterns_;
@@ -191,6 +238,29 @@ public:
     // by RESET, both of which must leave no entry pointing at the fd.
     void clearSubscriptions(Client& client);
 
+    // WATCH, from the server's side: the inverse index, key -> the connections
+    // watching it, one map per database. It lives here rather than in Database
+    // because a watch is a fact about a connection, and a Database knows
+    // nothing about connections.
+    void watchKey(Client& client, const std::string& key);
+    void unwatchAllKeys(Client& client);
+    // Ends a transaction: the queue, the flags and the watches all go.
+    void discardTransaction(Client& client);
+    // Marks every connection watching `key` so that its EXEC will refuse to
+    // run. `from_expiry` says the change was a key dying of its own TTL, which
+    // is not news to a watcher that had already seen it as expired.
+    void signalModifiedKey(int db_index, const std::string& key, bool from_expiry);
+    // FLUSHDB and FLUSHALL raise no keyspace event, so they signal by hand --
+    // and only for keys that were actually there. Emptying a database that a
+    // watcher's key was never in changes nothing for that watcher.
+    void touchWatchedKeysOnFlush(int db_index);
+
+    // Runs one command's handler and nothing else: no arity check, no queueing,
+    // no flush of pending pushes. Public because EXEC drives it -- a
+    // transaction is this call in a loop over a queue instead of over a socket.
+    void callCommand(Client& client, const CommandSpec& spec,
+                     const std::vector<std::string>& argv, net::ReplyWriter& writer);
+
     const std::string& runId() const { return run_id_; }
 
     // Closes a connection and frees its state. Safe to call from a command
@@ -217,6 +287,9 @@ private:
     std::int64_t                                    start_time_ms_  = 0;
     std::uint64_t                                   dirty_          = 0;
     PubSub                                          pubsub_;
+    // Indexed by database, so a lookup on the write path is one hash of the key
+    // in a map that is empty on almost every server.
+    std::vector<std::unordered_map<std::string, std::set<int>>> watched_keys_;
     // Frames a command owes its own connection. Redis answers a command before
     // delivering any message it caused to the client that ran it, so these are
     // held back until the handler's reply has been written.
