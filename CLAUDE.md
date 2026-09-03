@@ -228,10 +228,16 @@ unknown-command error rather than a stub.
 - Reach for `/effort xhigh` for byte-format work (RDB, PSYNC framing) and drop
   back to the project default for command handlers that follow an existing
   pattern.
-- Measured on this repo: **~80k tokens per turn, 93-96% of it cache reads** of
-  accumulated context. Cost is `turns x mean context`, so the only two levers
-  are ending the session early and reading narrowly. Read what the feature
-  touches once, up front, in one batched command -- discovering an API over six
-  turns costs six full context replays. And note that a wide read is charged
-  every turn afterwards, not once: the cost of reading all of `rdb.cpp` is its
-  residency, not the read.
+- Measured across nine sessions of this repo: **~80k tokens per turn, 93-96% of
+  it cache reads** of accumulated context. Cost is `turns x mean context`.
+- Of those two factors, **turn count is the one worth optimising**, and it was
+  tested rather than assumed. The ZSET-lex session read every file the feature
+  touched up front in batched parallel calls and then wrote, and came in at
+  4.3k tokens per line changed against 8.8-12.7k for the three feature sessions
+  before it. Its mean context per turn was *higher* than the repo average (94k
+  vs 81k) -- the wide up-front reads cost exactly what residency predicts --
+  and it still won, on 25 turns against 91-409. Do not chase the cache-read
+  share: it fell to 79% there only because output rose, which is what progress
+  looks like. Caveats worth keeping: n=1, lines changed is a poor proxy for
+  difficulty, and one compaction inside that session reset residency in its
+  favour.
