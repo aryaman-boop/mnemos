@@ -31,6 +31,7 @@ LEGACY = "2025-11-25"
 
 results = []
 failures = []
+skipped = []
 
 
 def check(name, condition, detail=""):
@@ -44,6 +45,13 @@ def check(name, condition, detail=""):
 
 def check_eq(name, got, want):
     return check(name, got == want, f"got {got!r}, want {want!r}")
+
+
+def skip(name, want):
+    """A check the reference redis is too old to be asked -- recorded, not run,
+    and kept out of the totals."""
+    results.append(("skip", name))
+    skipped.append(name)
 
 
 # --------------------------------------------------------------------- client
@@ -407,16 +415,22 @@ DIFF_SETUP = [
     ["EXPIRE", "d:str", "1000"],
 ]
 
+# Entries are (name, tool, arguments) with an optional fourth element: the
+# earliest reference redis whose answer this can be compared against.
 DIFF_CALLS = [
     ("get a string", "get", {"key": "d:str"}),
     ("get a missing key", "get", {"key": "d:nope"}),
     ("describe a string", "describe_key", {"key": "d:str"}),
     ("describe an int-encoded string", "describe_key", {"key": "d:int"}),
     ("describe a raw string", "describe_key", {"key": "d:long"}),
-    ("describe a list", "describe_key", {"key": "d:list"}),
+    # Redis 7.2 is where small lists and small non-integer sets gained their own
+    # listpack encoding; before it they report quicklist and hashtable. mnemos
+    # targets current redis, so an older reference is out of date here rather
+    # than in disagreement -- the same gate the differential suite uses.
+    ("describe a list", "describe_key", {"key": "d:list"}, (7, 2)),
     ("describe a hash", "describe_key", {"key": "d:hash"}),
     ("describe an intset", "describe_key", {"key": "d:intset"}),
-    ("describe a set", "describe_key", {"key": "d:set"}),
+    ("describe a set", "describe_key", {"key": "d:set"}, (7, 2)),
     ("describe a zset", "describe_key", {"key": "d:zset"}),
     ("describe a missing key", "describe_key", {"key": "d:nope"}),
     ("scan the keyspace", "scan_keys", {"pattern": "d:*"}),
@@ -464,12 +478,27 @@ def sorted_if_unordered(name, payload):
     return payload
 
 
+def reference_version(client):
+    """The reference server's version, as a comparable tuple. Calls tagged with
+    a minimum are skipped below it."""
+    payload, _ = client.tool_json("server_info", {"section": "server"})
+    text = (payload or {}).get("sections", {}).get("server", {}).get("redis_version", "")
+    parts = str(text).strip().split(".")
+    return tuple(int(p) for p in parts[:3] if p.isdigit())
+
+
 def run_differential(a, b, quiet):
+    reference = reference_version(b)
     for argv in DIFF_SETUP:
         a.tool_json("redis_command", {"argv": argv})
         b.tool_json("redis_command", {"argv": argv})
 
-    for name, tool, arguments in DIFF_CALLS:
+    for entry in DIFF_CALLS:
+        name, tool, arguments = entry[:3]
+        want = entry[3] if len(entry) > 3 else None
+        if want and reference < want:
+            skip(f"diff: {name} (needs redis >= {'.'.join(map(str, want))})", want)
+            continue
         ra = a.call(tool, arguments).get("result", {})
         rb = b.call(tool, arguments).get("result", {})
         ta = ra.get("content", [{}])[0].get("text", "")
@@ -570,7 +599,7 @@ def main():
 
     if not args.quiet:
         for status, name in results:
-            print(f"  {'ok  ' if status == 'ok' else 'FAIL'} {name}")
+            print(f"  {status.ljust(4)} {name}")
         print()
     else:
         for name, detail in failures:
@@ -578,7 +607,7 @@ def main():
             for line in detail.splitlines():
                 print(f"           {line}")
 
-    total = len(results)
+    total = len(results) - len(skipped)
     if failures:
         if not args.quiet:
             for name, detail in failures:
@@ -587,7 +616,13 @@ def main():
                     print(f"      {line}")
         print(f"{len(failures)} of {total} checks failed")
         return 1
-    note = "" if have_redis else " (differential skipped: redis-server not found)"
+    if not have_redis:
+        note = " (differential skipped: redis-server not found)"
+    elif skipped:
+        note = (f" ({len(skipped)} skipped: reference redis is older than the "
+                "behaviour tested)")
+    else:
+        note = ""
     print(f"all {total} checks passed{note}")
     return 0
 
