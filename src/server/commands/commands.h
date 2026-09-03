@@ -155,6 +155,11 @@ void zremrangebyscore(CommandContext&);
 void zpopmin(CommandContext&);
 void zpopmax(CommandContext&);
 void zrandmember(CommandContext&);
+void zrangebylex(CommandContext&);
+void zrevrangebylex(CommandContext&);
+void zlexcount(CommandContext&);
+void zremrangebylex(CommandContext&);
+void zrangestore(CommandContext&);
 
 // --- persist_commands.cpp ---------------------------------------------------
 void dump(CommandContext&);

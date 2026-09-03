@@ -170,10 +170,55 @@ for byte (the `rdb:` suites). Version 15, CRC-64/Jones, liblzf ported.
   listpacks and quicklists and `ZSET_2` included; keep new differential cases
   under the encoding thresholds so they stay so.
 
-## Not yet implemented
+## Roadmap
 
-AOF with rewrite, replication over `PSYNC`, the MCP server.
-Unimplemented commands return an unknown-command error rather than a stub.
+Roughly 110 in-scope commands remain of ~250. The order below is not
+preference: three pieces of infrastructure are shared, and building a consumer
+before the thing it consumes means building that thing twice.
+
+**Ordering constraints, in force:**
+
+- **Propagation before AOF, and AOF before replication.** The layer that
+  rewrites a command into its deterministic effect (`SPOP` -> `SREM`, `EXPIRE`
+  -> `PEXPIREAT`, `INCRBYFLOAT` -> `SET`) does not exist yet. AOF and `PSYNC`
+  both need exactly it, and `MONITOR` falls out of it nearly free.
+- **Blocking infrastructure before any blocking command.** One blocked-client
+  registry, ready-key signal and timeout wheel serve `BLPOP`, `BZPOPMIN`,
+  `BLMPOP`, `XREAD BLOCK` and `WAIT`. Reaching streams without it means
+  writing it a second time.
+- **Hash-field TTL before its RDB type**, not after: the `listpackex` encoding
+  is what that new RDB type stores.
+
+In order:
+
+1. ZSET completion -- lex ranges and the modern `ZRANGE` argument forms
+   first, then the set ops (`ZUNIONSTORE` and family), `ZMPOP`, `ZINTERCARD`.
+   No new infrastructure; every command follows a pattern already in the file.
+2. Bitmaps -- `SETBIT` through `BITFIELD`, whose type/overflow grammar is the
+   real work.
+3. Cursor scans -- `HSCAN`, `SSCAN`, `ZSCAN`. Needs a reverse-binary cursor
+   over `Dict` to keep Redis's guarantee across a rehash; trivial while the
+   collection is still a listpack.
+4. `SORT`/`SORT_RO`, `LCS`, `LINSERT`, `LMPOP`, `MOVE`, `SWAPDB`.
+5. Hash-field TTL -- `HEXPIRE` and family, a `listpackex` encoding, field
+   expiry. Not testable on the ubuntu runner; gate at `min_redis: (7, 4)`.
+6. HyperLogLog -- sparse and dense encodings, byte-exact. `/effort xhigh`.
+7. Geo -- 52-bit geohash over a zset, neighbour-cell search. `/effort xhigh`.
+8. Blocking infrastructure, then the blocking list and zset pops.
+9. Streams -- a whole new type, and large enough to split in two: the type
+   with `XADD`/`XRANGE`/`XTRIM` and its RDB encoding, then consumer groups.
+10. The propagation layer, then AOF with rewrite, then replication over
+    `PSYNC` -- itself split, full sync before backlog and partial resync.
+11. The MCP server. Nothing to diff against, so no differential suite.
+12. ACL, `CLIENT KILL`/`UNBLOCK`/`PAUSE`/`TRACKING`, `SLOWLOG`, `LATENCY`,
+    `MONITOR`, and a single-node `CLUSTER` shim.
+
+**Explicit non-goals.** `EVAL`/`EVALSHA`/`FUNCTION`/`FCALL` need a Lua
+interpreter, and the zero-dependency rule means writing one -- more work than
+everything above put together. Also out: modules, vector sets, the cluster bus,
+and the commands proprietary to the 8.10 reference (`hotkeys`, `backup`,
+`himport`, the `ar*` and `V*` families). Unimplemented commands return an
+unknown-command error rather than a stub.
 
 ## Working agreement
 
@@ -183,3 +228,10 @@ Unimplemented commands return an unknown-command error rather than a stub.
 - Reach for `/effort xhigh` for byte-format work (RDB, PSYNC framing) and drop
   back to the project default for command handlers that follow an existing
   pattern.
+- Measured on this repo: **~80k tokens per turn, 93-96% of it cache reads** of
+  accumulated context. Cost is `turns x mean context`, so the only two levers
+  are ending the session early and reading narrowly. Read what the feature
+  touches once, up front, in one batched command -- discovering an API over six
+  turns costs six full context replays. And note that a wide read is charged
+  every turn afterwards, not once: the cost of reading all of `rdb.cpp` is its
+  residency, not the read.

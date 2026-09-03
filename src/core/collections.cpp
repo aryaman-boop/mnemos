@@ -489,6 +489,27 @@ std::vector<std::pair<std::string, double>> ZSetValue::rangeByScore(
     return out;
 }
 
+std::vector<std::pair<std::string, double>> ZSetValue::rangeByLex(
+    const LexRange& range) const {
+    std::vector<std::pair<std::string, double>> out;
+    if (range.isEmpty()) return out;
+
+    // A contiguous run, not a filter: Redis seeks to the first member at or
+    // past the minimum and then stops at the first one past the maximum. The
+    // two agree while the scores are uniform, and it is the run that Redis
+    // returns when they are not.
+    bool started = false;
+    for (const auto& entry : all()) {
+        if (!started) {
+            if (!range.aboveMin(entry.first)) continue;
+            started = true;
+        }
+        if (!range.belowMax(entry.first)) break;
+        out.push_back(entry);
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // ListValue
 // ---------------------------------------------------------------------------

@@ -328,70 +328,144 @@ void zrank(CommandContext& ctx)    { rankGeneric(ctx, false); }
 void zrevrank(CommandContext& ctx) { rankGeneric(ctx, true); }
 
 namespace {
-void rangeByIndex(CommandContext& ctx, bool reverse) {
-    std::int64_t start = 0, stop = 0;
-    if (!stringToInt64(ctx.arg(2), start) || !stringToInt64(ctx.arg(3), stop)) {
-        replies::notAnInteger(ctx.reply);
-        return;
-    }
-    bool with_scores = false;
-    for (std::size_t i = 4; i < ctx.argc(); ++i) {
-        if (equalsIgnoreCase(ctx.arg(i), "WITHSCORES")) with_scores = true;
-        else {
-            replies::syntaxError(ctx.reply);
-            return;
-        }
-    }
 
-    bool type_error = false;
-    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::ZSet, type_error);
-    if (type_error) return;
-    if (!value) {
-        ctx.reply.arrayHeader(0);
-        return;
-    }
+// The three things the ZRANGE family can range over. Redis folded all of them
+// into one command in 7.0 and kept the older spellings as fixed forms of the
+// same grammar, so one parser and one collector serve every one of them.
+enum class RangeBy { Rank, Score, Lex };
 
-    std::vector<std::pair<std::string, double>> all = value->zset()->all();
-    if (reverse) std::reverse(all.begin(), all.end());
+struct RangeSpec {
+    RangeBy          by          = RangeBy::Rank;
+    bool             reverse     = false;
+    bool             with_scores = false;
+    bool             has_limit   = false;
+    std::int64_t     offset      = 0;
+    std::int64_t     count       = -1;
+    std::int64_t     start       = 0;  // BYRANK only
+    std::int64_t     stop        = 0;
+    core::ScoreRange score;
+    core::LexRange   lex;
+};
 
-    if (!resolveIndexRange(start, stop, static_cast<std::int64_t>(all.size()))) {
-        ctx.reply.arrayHeader(0);
-        return;
+// "-", "+", "[member" or "(member". A bare member is not a lex bound: the
+// bracket is what says whether the endpoint is included, and Redis refuses
+// rather than guessing.
+bool parseLexBound(const std::string& text, core::LexBound& bound) {
+    if (text == "-") { bound.kind = core::LexBound::Kind::NegInf; return true; }
+    if (text == "+") { bound.kind = core::LexBound::Kind::PosInf; return true; }
+    if (!text.empty() && (text.front() == '[' || text.front() == '(')) {
+        bound.kind      = core::LexBound::Kind::Value;
+        bound.exclusive = text.front() == '(';
+        bound.value     = text.substr(1);
+        return true;
     }
-    emitMembers(ctx, {all.begin() + start, all.begin() + stop + 1}, with_scores);
+    return false;
 }
 
-void rangeByScore(CommandContext& ctx, bool reverse) {
-    // ZREVRANGEBYSCORE takes its bounds as (max, min), the reverse of
-    // ZRANGEBYSCORE -- a genuine asymmetry in the command set.
-    const std::string& first  = reverse ? ctx.arg(3) : ctx.arg(2);
-    const std::string& second = reverse ? ctx.arg(2) : ctx.arg(3);
-
-    ScoreRange range;
-    if (!parseScoreBound(first, range.min, range.min_exclusive) ||
-        !parseScoreBound(second, range.max, range.max_exclusive)) {
-        ctx.reply.error("ERR min or max is not a float");
-        return;
-    }
-
-    bool         with_scores = false;
-    bool         has_limit   = false;
-    std::int64_t offset = 0, count = -1;
-    for (std::size_t i = 4; i < ctx.argc(); ++i) {
-        if (equalsIgnoreCase(ctx.arg(i), "WITHSCORES")) {
-            with_scores = true;
-        } else if (equalsIgnoreCase(ctx.arg(i), "LIMIT") && i + 2 < ctx.argc()) {
-            if (!stringToInt64(ctx.arg(i + 1), offset) || !stringToInt64(ctx.arg(i + 2), count)) {
+// Parses the two bounds at `min_index` and every option after them. `generic`
+// selects the modern ZRANGE/ZRANGESTORE grammar, which picks its own BY and
+// REV; the fixed forms arrive with both already decided and accept only LIMIT
+// and WITHSCORES. Writes the error and returns false on any refusal.
+bool parseRangeSpec(CommandContext& ctx, std::size_t min_index, bool generic,
+                    bool allow_with_scores, RangeSpec& spec) {
+    for (std::size_t i = min_index + 2; i < ctx.argc(); ++i) {
+        const std::string& token = ctx.arg(i);
+        if (generic && equalsIgnoreCase(token, "BYSCORE")) {
+            spec.by = RangeBy::Score;
+        } else if (generic && equalsIgnoreCase(token, "BYLEX")) {
+            spec.by = RangeBy::Lex;
+        } else if (generic && equalsIgnoreCase(token, "REV")) {
+            spec.reverse = true;
+        } else if (allow_with_scores && equalsIgnoreCase(token, "WITHSCORES")) {
+            spec.with_scores = true;
+        // Accepted by every form, including the ones that cannot honour it: the
+        // two combinations below are refused after the loop, by name, and even
+        // ZREVRANGE reports them that way rather than a plain syntax error.
+        } else if (equalsIgnoreCase(token, "LIMIT") && i + 2 < ctx.argc()) {
+            if (!stringToInt64(ctx.arg(i + 1), spec.offset) ||
+                !stringToInt64(ctx.arg(i + 2), spec.count)) {
                 replies::notAnInteger(ctx.reply);
-                return;
+                return false;
             }
-            has_limit = true;
+            spec.has_limit = true;
             i += 2;
         } else {
             replies::syntaxError(ctx.reply);
-            return;
+            return false;
         }
     }
+
+    if (spec.has_limit && spec.by == RangeBy::Rank) {
+        ctx.reply.error(
+            "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX");
+        return false;
+    }
+    if (spec.with_scores && spec.by == RangeBy::Lex) {
+        ctx.reply.error("ERR syntax error, WITHSCORES not supported in combination with BYLEX");
+        return false;
+    }
+
+    // REV swaps which argument is the minimum for a score or lex range -- those
+    // are then written (max, min). An index range keeps its argument order and
+    // simply indexes the reversed sequence, which is why it reads arg directly.
+    const std::string& low  = spec.reverse ? ctx.arg(min_index + 1) : ctx.arg(min_index);
+    const std::string& high = spec.reverse ? ctx.arg(min_index) : ctx.arg(min_index + 1);
+
+    switch (spec.by) {
+        case RangeBy::Rank:
+            if (!stringToInt64(ctx.arg(min_index), spec.start) ||
+                !stringToInt64(ctx.arg(min_index + 1), spec.stop)) {
+                replies::notAnInteger(ctx.reply);
+                return false;
+            }
+            break;
+        case RangeBy::Score:
+            if (!parseScoreBound(low, spec.score.min, spec.score.min_exclusive) ||
+                !parseScoreBound(high, spec.score.max, spec.score.max_exclusive)) {
+                ctx.reply.error("ERR min or max is not a float");
+                return false;
+            }
+            break;
+        case RangeBy::Lex:
+            if (!parseLexBound(low, spec.lex.min) || !parseLexBound(high, spec.lex.max)) {
+                ctx.reply.error("ERR min or max not valid string range item");
+                return false;
+            }
+            break;
+    }
+    return true;
+}
+
+std::vector<std::pair<std::string, double>> collectRange(const ZSetValue& zset,
+                                                         const RangeSpec& spec) {
+    if (spec.by == RangeBy::Rank) {
+        std::vector<std::pair<std::string, double>> all = zset.all();
+        if (spec.reverse) std::reverse(all.begin(), all.end());
+        std::int64_t start = spec.start, stop = spec.stop;
+        if (!resolveIndexRange(start, stop, static_cast<std::int64_t>(all.size()))) return {};
+        return {all.begin() + start, all.begin() + stop + 1};
+    }
+
+    std::vector<std::pair<std::string, double>> items =
+        spec.by == RangeBy::Score ? zset.rangeByScore(spec.score) : zset.rangeByLex(spec.lex);
+    if (spec.reverse) std::reverse(items.begin(), items.end());
+    if (!spec.has_limit) return items;
+
+    // A negative offset selects nothing; a negative count means "to the end".
+    if (spec.offset < 0 || static_cast<std::size_t>(spec.offset) >= items.size()) return {};
+    items.erase(items.begin(), items.begin() + spec.offset);
+    if (spec.count >= 0 && static_cast<std::size_t>(spec.count) < items.size()) {
+        items.resize(static_cast<std::size_t>(spec.count));
+    }
+    return items;
+}
+
+void rangeCommand(CommandContext& ctx, RangeBy by, bool reverse, bool generic,
+                  bool allow_with_scores) {
+    RangeSpec spec;
+    spec.by      = by;
+    spec.reverse = reverse;
+    if (!parseRangeSpec(ctx, 2, generic, allow_with_scores, spec)) return;
 
     bool type_error = false;
     Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::ZSet, type_error);
@@ -400,29 +474,29 @@ void rangeByScore(CommandContext& ctx, bool reverse) {
         ctx.reply.arrayHeader(0);
         return;
     }
-
-    std::vector<std::pair<std::string, double>> items = value->zset()->rangeByScore(range);
-    if (reverse) std::reverse(items.begin(), items.end());
-
-    if (has_limit) {
-        if (offset < 0 || static_cast<std::size_t>(offset) >= items.size()) {
-            ctx.reply.arrayHeader(0);
-            return;
-        }
-        items.erase(items.begin(), items.begin() + offset);
-        // A negative count means "everything from the offset onwards".
-        if (count >= 0 && static_cast<std::size_t>(count) < items.size()) {
-            items.resize(static_cast<std::size_t>(count));
-        }
-    }
-    emitMembers(ctx, items, with_scores);
+    emitMembers(ctx, collectRange(*value->zset(), spec), spec.with_scores);
 }
+
 }  // namespace
 
-void zrange(CommandContext& ctx)             { rangeByIndex(ctx, false); }
-void zrevrange(CommandContext& ctx)          { rangeByIndex(ctx, true); }
-void zrangebyscore(CommandContext& ctx)      { rangeByScore(ctx, false); }
-void zrevrangebyscore(CommandContext& ctx)   { rangeByScore(ctx, true); }
+void zrange(CommandContext& ctx) {
+    rangeCommand(ctx, RangeBy::Rank, false, true, true);
+}
+void zrevrange(CommandContext& ctx) {
+    rangeCommand(ctx, RangeBy::Rank, true, false, true);
+}
+void zrangebyscore(CommandContext& ctx) {
+    rangeCommand(ctx, RangeBy::Score, false, false, true);
+}
+void zrevrangebyscore(CommandContext& ctx) {
+    rangeCommand(ctx, RangeBy::Score, true, false, true);
+}
+void zrangebylex(CommandContext& ctx) {
+    rangeCommand(ctx, RangeBy::Lex, false, false, true);
+}
+void zrevrangebylex(CommandContext& ctx) {
+    rangeCommand(ctx, RangeBy::Lex, true, false, true);
+}
 
 void zcount(CommandContext& ctx) {
     ScoreRange range;
@@ -545,6 +619,78 @@ void zrandmember(CommandContext& ctx) {
         picked.assign(shuffled.begin(), shuffled.begin() + static_cast<std::ptrdiff_t>(wanted));
     }
     emitMembers(ctx, picked, with_scores);
+}
+
+
+void zlexcount(CommandContext& ctx) {
+    core::LexRange range;
+    if (!parseLexBound(ctx.arg(2), range.min) || !parseLexBound(ctx.arg(3), range.max)) {
+        ctx.reply.error("ERR min or max not valid string range item");
+        return;
+    }
+    bool type_error = false;
+    Value* value = lookupTypedRead(ctx, ctx.arg(1), ObjType::ZSet, type_error);
+    if (type_error) return;
+    ctx.reply.integer(value ? static_cast<std::int64_t>(value->zset()->rangeByLex(range).size())
+                            : 0);
+}
+
+void zremrangebylex(CommandContext& ctx) {
+    core::LexRange range;
+    if (!parseLexBound(ctx.arg(2), range.min) || !parseLexBound(ctx.arg(3), range.max)) {
+        ctx.reply.error("ERR min or max not valid string range item");
+        return;
+    }
+    bool type_error = false;
+    Value* value = lookupTyped(ctx, ctx.arg(1), ObjType::ZSet, type_error);
+    if (type_error) return;
+    if (!value) {
+        ctx.reply.integer(0);
+        return;
+    }
+    std::int64_t removed = 0;
+    for (const auto& [member, score] : value->zset()->rangeByLex(range)) {
+        if (value->zset()->erase(member)) ++removed;
+    }
+    if (removed > 0) {
+        ctx.server.markDirty(static_cast<std::uint64_t>(removed));
+        notifyKeyspaceEvent(ctx, notify::kZset, "zremrangebylex", ctx.arg(1));
+    }
+    deleteIfEmpty(ctx, ctx.arg(1), *value);
+    ctx.reply.integer(removed);
+}
+
+void zrangestore(CommandContext& ctx) {
+    RangeSpec spec;
+    if (!parseRangeSpec(ctx, 3, /*generic=*/true, /*allow_with_scores=*/false, spec)) return;
+
+    bool type_error = false;
+    Value* source = lookupTypedRead(ctx, ctx.arg(2), ObjType::ZSet, type_error);
+    if (type_error) return;
+
+    std::vector<std::pair<std::string, double>> items;
+    if (source) items = collectRange(*source->zset(), spec);
+
+    const std::string& destination = ctx.arg(1);
+    if (items.empty()) {
+        // An empty result leaves no empty zset behind: it removes whatever the
+        // destination held, and a key that really disappeared says so.
+        if (ctx.db.erase(destination)) {
+            ctx.server.markDirty();
+            notifyKeyspaceEvent(ctx, notify::kGeneric, "del", destination);
+        }
+        ctx.reply.integer(0);
+        return;
+    }
+
+    // setKey rather than a merge: the destination is replaced outright, TTL
+    // included, whatever type it used to hold.
+    Value fresh = Value::makeZSet();
+    for (const auto& [member, score] : items) fresh.zset()->add(member, score);
+    ctx.db.setKey(destination, std::move(fresh));
+    ctx.server.markDirty(items.size());
+    notifyKeyspaceEvent(ctx, notify::kZset, "zrangestore", destination);
+    ctx.reply.integer(static_cast<std::int64_t>(items.size()));
 }
 
 }  // namespace mnemos::server::cmd

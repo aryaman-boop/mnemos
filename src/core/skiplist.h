@@ -48,6 +48,49 @@ struct ScoreRange {
     }
 };
 
+// One end of a ZRANGEBYLEX range. Redis spells the two infinities "-" and "+"
+// and a member bound "[m" or "(m", so a bound is three states rather than a
+// string plus a flag -- "+" as a *minimum* is a legal, empty range, and no
+// string value can stand in for it.
+struct LexBound {
+    enum class Kind { NegInf, Value, PosInf };
+    Kind        kind      = Kind::NegInf;
+    std::string value;
+    bool        exclusive = false;
+};
+
+// Comparison is bytewise over the member alone. That is only meaningful when
+// every member shares one score, which is the contract ZRANGEBYLEX documents;
+// with mixed scores Redis walks the same (score, member) order and so returns
+// the same run we do, but neither result means much.
+struct LexRange {
+    LexBound min;
+    LexBound max;
+
+    bool aboveMin(const std::string& member) const {
+        if (min.kind == LexBound::Kind::NegInf) return true;
+        if (min.kind == LexBound::Kind::PosInf) return false;
+        const int c = member.compare(min.value);
+        return min.exclusive ? c > 0 : c >= 0;
+    }
+    bool belowMax(const std::string& member) const {
+        if (max.kind == LexBound::Kind::PosInf) return true;
+        if (max.kind == LexBound::Kind::NegInf) return false;
+        const int c = member.compare(max.value);
+        return max.exclusive ? c < 0 : c <= 0;
+    }
+    bool isEmpty() const {
+        if (min.kind == LexBound::Kind::PosInf) return true;
+        if (max.kind == LexBound::Kind::NegInf) return true;
+        if (min.kind == LexBound::Kind::Value && max.kind == LexBound::Kind::Value) {
+            const int c = min.value.compare(max.value);
+            if (c > 0) return true;
+            if (c == 0 && (min.exclusive || max.exclusive)) return true;
+        }
+        return false;
+    }
+};
+
 class SkipList {
 public:
     struct Node {

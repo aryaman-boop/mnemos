@@ -179,6 +179,13 @@ const std::vector<CommandSpec>& table() {
         {"zpopmin",       cmd::zpopmin,            -2,  kWrite | kFast,               1,  1,  1},
         {"zpopmax",       cmd::zpopmax,            -2,  kWrite | kFast,               1,  1,  1},
         {"zrandmember",   cmd::zrandmember,        -2,  kReadOnly,                    1,  1,  1},
+        {"zrangebylex",   cmd::zrangebylex,        -4,  kReadOnly,                    1,  1,  1},
+        {"zrevrangebylex", cmd::zrevrangebylex,    -4,  kReadOnly,                    1,  1,  1},
+        {"zlexcount",     cmd::zlexcount,           4,  kReadOnly | kFast,            1,  1,  1},
+        {"zremrangebylex", cmd::zremrangebylex,     4,  kWrite,                       1,  1,  1},
+        // Two keys, destination first: ZRANGESTORE is the only zset command a
+        // cluster proxy has to route on more than one.
+        {"zrangestore",   cmd::zrangestore,        -5,  kWrite,                       1,  2,  1},
     };
     return commands;
 }

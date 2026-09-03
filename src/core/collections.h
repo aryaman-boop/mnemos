@@ -163,6 +163,7 @@ public:
                                                       std::size_t stop) const;
     std::vector<std::pair<std::string, double>> all() const;
     std::vector<std::pair<std::string, double>> rangeByScore(const ScoreRange& range) const;
+    std::vector<std::pair<std::string, double>> rangeByLex(const LexRange& range) const;
 
     const Listpack& listpack() const { return listpack_; }
     // RDB load. The blob is already ordered by (score, member); adopting it
