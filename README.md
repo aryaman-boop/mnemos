@@ -3,10 +3,10 @@
 An in-memory key-value server that speaks the Redis protocol, written from
 scratch in C++23. Any Redis client works with it, including `redis-cli`.
 
-An [MCP](https://modelcontextprotocol.io/) server is next, so an AI assistant
-can inspect a running instance directly — read keys, watch encodings change,
-check what the event loop is doing. The design is written up in
-[`src/mcp/DESIGN.md`](src/mcp/DESIGN.md); the code isn't there yet.
+It also ships an [MCP](https://modelcontextprotocol.io/) server, so an AI
+assistant can inspect a running instance directly — read keys, watch encodings
+change, check what the event loop is doing. It is a RESP client, so you can
+point it at a real `redis-server` just as happily.
 
 ```console
 $ mnemos-server --port 6380
@@ -47,9 +47,9 @@ table plus a handler function. If you want a key-value server with custom
 commands, a different eviction policy, or your own data type, this is a
 reasonable starting point that already handles the networking and protocol.
 
-**Letting an agent inspect your cache** *(planned)*. The MCP layer will mean you
-can ask Claude "what's in this keyspace and why is it using so much memory" and
-have it actually look, rather than you pasting `INFO` output back and forth.
+**Letting an agent inspect your cache.** `mnemos-mcp` means you can ask Claude
+"what's in this keyspace and why is it using so much memory" and have it
+actually look, rather than you pasting `INFO` output back and forth.
 
 ## Install
 
@@ -73,6 +73,27 @@ no third-party libraries for the server, the tests, or CI.
 --maxclients <n>      Connection limit (default 10000)
 --notify-keyspace-events <flags>
                       Keyspace notification classes (default off)
+```
+
+The MCP server is a second binary. It connects to a running server over TCP and
+speaks JSON-RPC over stdio, which is what an MCP client expects to launch:
+
+```bash
+./build/mnemos-mcp --port 6380 --read-only
+```
+
+```
+--host <addr>         Server to connect to (default 127.0.0.1)
+--port <n>            Server port (default 6380)
+--db <n>              Database to SELECT after connecting (default 0)
+--timeout <ms>        Socket timeout (default 5000)
+--read-only           Refuse any command that writes or administers
+```
+
+To register it with Claude Code:
+
+```bash
+claude mcp add mnemos -- /path/to/mnemos/build/mnemos-mcp --port 6380
 ```
 
 ## Features
@@ -108,6 +129,12 @@ no third-party libraries for the server, the tests, or CI.
   mnemos writes load into a live `redis-server` and vice versa, and `DUMP`
   payloads match byte for byte. A value is saved in the encoding it is actually
   in, so `OBJECT ENCODING` still tells the truth after `DEBUG RELOAD`.
+- **An MCP server**, `mnemos-mcp`. Six tools — `redis_command` as the escape
+  hatch plus `get`, `set`, `scan_keys`, `describe_key` and `server_info`. RESP3
+  types map onto JSON directly, `describe_key` surfaces the real in-memory
+  encoding, and `--read-only` refuses anything that writes or administers,
+  classifying commands through the server's own command table. Speaks both the
+  `initialize` handshake and the 2026-07-28 revision's per-request `_meta`.
 - **Keyspace notifications** — `notify-keyspace-events` with the whole class
   bitmask, publishing to `__keyspace@<db>__:<key>` and `__keyevent@<db>__:<event>`.
   The event names, the order two of them arrive in, which commands stay silent,
@@ -121,7 +148,6 @@ no third-party libraries for the server, the tests, or CI.
 - [ ] Blocking commands — `BLPOP`, `BZPOPMIN`, `BLMPOP`
 - [ ] Streams, with consumer groups
 - [ ] Command propagation, then AOF with rewrite, then replication over `PSYNC`
-- [ ] The MCP server
 
 Until then, any command that isn't implemented returns an unknown-command
 error rather than doing something surprising.
@@ -188,10 +214,11 @@ src/net/       event loop, RESP parsing and serialisation
 src/core/      value objects, encodings, listpack, intset, skiplist, dict
 src/server/    server, connections, databases, commands
 src/persist/   the RDB codec: CRC64, LZF, objects, whole files
+src/client/    a blocking RESP client
 src/repl/      replication                          (not started)
-src/mcp/       MCP server                           (designed, not started)
+src/mcp/       the MCP server: JSON, JSON-RPC, tools
 tests/         unit tests
-scripts/       check.sh, interop and differential suites
+scripts/       check.sh, interop, differential and MCP suites
 ```
 
 ## License

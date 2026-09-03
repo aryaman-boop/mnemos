@@ -86,6 +86,17 @@ if [[ $UNIT_ONLY -eq 0 ]]; then
             run "differential" "${ROOT}/scripts/differential_test.sh"
         fi
     fi
+
+    # The MCP suite needs no redis of its own -- it starts mnemos-server and
+    # talks to it through mnemos-mcp. It uses a real redis for its differential
+    # half when one is on PATH, and reports that half as skipped otherwise.
+    if [[ ! -x "${BUILD}/mnemos-mcp" ]]; then
+        skip "mcp" "mnemos-mcp not built"
+    else
+        mcp_args=(--build "$BUILD")
+        [[ $VERBOSE -eq 1 ]] || mcp_args+=(--quiet)
+        run "mcp" python3 "${ROOT}/scripts/mcp_test.py" "${mcp_args[@]}"
+    fi
 fi
 
 # ---------------------------------------------------------------- summary

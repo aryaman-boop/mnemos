@@ -45,6 +45,12 @@ jobs:
       - name: Differential test against real redis-server
         run: ./scripts/differential_test.sh
 
+      # mnemos-mcp is a RESP client, so the same tool calls run against a real
+      # redis-server and the JSON is compared -- an oracle for everything but
+      # the JSON-RPC framing, which the same suite checks directly.
+      - name: MCP tests
+        run: python3 ./scripts/mcp_test.py
+
   sanitizers:
     name: asan+ubsan
     runs-on: ubuntu-latest

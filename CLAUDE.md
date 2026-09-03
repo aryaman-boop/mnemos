@@ -35,6 +35,9 @@ new differential suite in `scripts/differential_test.py` (`SUITES`), not just a
 unit test. Error strings must be byte-identical to Redis's — use the helpers in
 `namespace replies` (`command_table.h`), never a hand-written string.
 
+The MCP server has its own suite, `scripts/mcp_test.py`, for the same reason
+and with the same oracle — see *MCP*.
+
 A suite is `(name, commands, flags)`. The flags that exist:
 
 - `two_clients` — each step is `(index, *command)` and runs on connection 0 or
@@ -57,13 +60,17 @@ src/core/      value objects, encodings: listpack, intset, skiplist, dict
 src/persist/   the RDB codec: CRC64, LZF, lengths, objects, whole files
 src/server/    server, connections, databases, command dispatch
 src/server/commands/   one file per command family
+src/client/    a blocking RESP client (mnemos-mcp now, the replica link later)
+src/mcp/       the MCP server: JSON, JSON-RPC, tools
 tests/         unit tests (ctest, harness in tests/test_harness.h)
-scripts/       interop + differential suites
+scripts/       interop + differential + MCP suites
 ```
 
 `CMakeLists.txt` globs `src/**/*.cpp` with `CONFIGURE_DEPENDS` — new source
-files need no build-file edit. `src/repl/` and `src/mcp/` are already wired in
-the glob and will build as soon as they contain sources.
+files need no build-file edit. `src/repl/` is already wired in the glob and
+will build as soon as it contains sources. `src/mcp/` is *not* in that glob: it
+builds only into the `mnemos-mcp` binary, so anything the server needs too
+belongs in `src/client/` instead.
 
 ## Adding a command
 
@@ -170,6 +177,42 @@ for byte (the `rdb:` suites). Version 15, CRC-64/Jones, liblzf ported.
   listpacks and quicklists and `ZSET_2` included; keep new differential cases
   under the encoding thresholds so they stay so.
 
+## MCP
+
+`mnemos-mcp` is a second binary and a **client of the server, not an embedding
+of it**. Two processes must be running. That buys two things: `src/client/`
+holds a RESP client the replica link will inherit rather than rewrite, and
+pointing `mnemos-mcp` at a real `redis-server` costs nothing and is where the
+differential half of `scripts/mcp_test.py` comes from.
+
+- **stdout is the wire.** Every log line, warning and error goes to stderr. One
+  stray `printf` on stdout corrupts the session. `src/main.cpp` prints to
+  stdout freely; that pattern does not transfer.
+- **Two eras, both live.** Revision `2026-07-28` replaced the `initialize`
+  handshake with per-request `params._meta` carrying
+  `io.modelcontextprotocol/protocolVersion` and `.../clientCapabilities`, and
+  made `server/discover` mandatory; the older revisions still handshake. A
+  request is modern iff that `_meta` version is present, and only then does the
+  result carry `resultType` and a `_meta` server identity. An unsupported
+  modern version is `-32022` with `data.supported`/`data.requested`.
+- **Two error channels, not interchangeable.** A malformed request, unknown
+  method or bad params is a JSON-RPC *error object*. A tool that ran and failed
+  — `WRONGTYPE`, an arity error, a dropped connection — is a *successful*
+  result carrying `isError: true`, because the model is meant to read the text
+  and adapt.
+- **The JSON layer is where the edge cases are.** Redis values are arbitrary
+  bytes and JSON strings are not: invalid UTF-8 becomes U+FFFD and the payload
+  gains `binary: true` rather than emitting invalid JSON. Numbers go through
+  `core::d2string`, and `inf`/`nan` become strings — the substitution RESP2
+  already makes. Parse depth is bounded (`kMaxJsonDepth`). Objects keep
+  insertion order, which is what makes the output stable enough to diff.
+- **`--read-only` fails closed.** Classification comes from the server's own
+  command table, so a command carrying `kWrite` or `kAdmin` is refused — and so
+  is one the table does not know, since an unclassifiable command cannot be
+  shown to be safe. It also hides `set` from `tools/list`.
+- Tool results are one serialised JSON object each, so a model gets the same
+  shape back whichever tool it called.
+
 ## Roadmap
 
 Roughly 110 in-scope commands remain of ~250. The order below is not
@@ -211,7 +254,9 @@ In order:
    with `XADD`/`XRANGE`/`XTRIM` and its RDB encoding, then consumer groups.
 10. The propagation layer, then AOF with rewrite, then replication over
     `PSYNC` -- itself split, full sync before backlog and partial resync.
-11. The MCP server. Nothing to diff against, so no differential suite.
+11. ~~The MCP server~~ **done**. See *MCP*. It turned out to have an oracle
+    after all: it is a RESP client, so the same tool calls run against a real
+    redis and the JSON is compared (`scripts/mcp_test.py`).
 12. ACL, `CLIENT KILL`/`UNBLOCK`/`PAUSE`/`TRACKING`, `SLOWLOG`, `LATENCY`,
     `MONITOR`, and a single-node `CLUSTER` shim.
 
