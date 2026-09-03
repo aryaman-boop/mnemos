@@ -3,9 +3,10 @@
 An in-memory key-value server that speaks the Redis protocol, written from
 scratch in C++23. Any Redis client works with it, including `redis-cli`.
 
-It also ships an [MCP](https://modelcontextprotocol.io/) server, so an AI
-assistant can inspect a running instance directly — read keys, watch encodings
-change, check what the event loop is doing.
+An [MCP](https://modelcontextprotocol.io/) server is next, so an AI assistant
+can inspect a running instance directly — read keys, watch encodings change,
+check what the event loop is doing. The design is written up in
+[`src/mcp/DESIGN.md`](src/mcp/DESIGN.md); the code isn't there yet.
 
 ```console
 $ mnemos-server --port 6380
@@ -46,9 +47,9 @@ table plus a handler function. If you want a key-value server with custom
 commands, a different eviction policy, or your own data type, this is a
 reasonable starting point that already handles the networking and protocol.
 
-**Letting an agent inspect your cache.** The MCP layer means you can ask Claude
-"what's in this keyspace and why is it using so much memory" and it can actually
-look, rather than you pasting `INFO` output back and forth.
+**Letting an agent inspect your cache** *(planned)*. The MCP layer will mean you
+can ask Claude "what's in this keyspace and why is it using so much memory" and
+have it actually look, rather than you pasting `INFO` output back and forth.
 
 ## Install
 
@@ -91,13 +92,22 @@ no third-party libraries for the server, the tests, or CI.
   reverse-binary cursor so iteration stays correct across a resize.
 - **TTLs** with both lazy and active expiry, including `EXPIRE`'s
   `NX`/`XX`/`GT`/`LT` options.
-- **~134 commands** — the string, list, hash, set and sorted-set families, the
-  full key/TTL surface, `SCAN` with `MATCH`/`COUNT`/`TYPE`, plus `OBJECT`,
-  `INFO`, `CONFIG`, `COMMAND`, `CLIENT` and `DEBUG`.
+- **156 commands** — the string, list, hash, set and sorted-set families
+  (including the sorted-set store operations, `ZRANGEBYLEX`, `ZINTERCARD` and
+  `ZMPOP`), the full key/TTL surface, `SCAN` with `MATCH`/`COUNT`/`TYPE`, plus
+  `OBJECT`, `INFO`, `CONFIG`, `COMMAND`, `CLIENT` and `DEBUG`.
 - **Pub/sub** — channel, pattern and shard subscriptions
   (`SSUBSCRIBE`/`SPUBLISH`), with messages framed as plain arrays for RESP2
   subscribers and as push frames for RESP3 ones, and the RESP2
   subscriber-mode command restriction that goes with it.
+- **Transactions** — `MULTI`, `EXEC`, `DISCARD`, `WATCH` and `UNWATCH`.
+  Validation happens at queue time, so a command that fails to queue aborts the
+  whole transaction with `EXECABORT` while a handler's own error does not. There
+  is no rollback, which is Redis's semantics rather than a shortcut.
+- **RDB persistence in the real format** — version 15, CRC-64/Jones, LZF. Files
+  mnemos writes load into a live `redis-server` and vice versa, and `DUMP`
+  payloads match byte for byte. A value is saved in the encoding it is actually
+  in, so `OBJECT ENCODING` still tells the truth after `DEBUG RELOAD`.
 - **Keyspace notifications** — `notify-keyspace-events` with the whole class
   bitmask, publishing to `__keyspace@<db>__:<key>` and `__keyevent@<db>__:<event>`.
   The event names, the order two of them arrive in, which commands stay silent,
@@ -106,10 +116,11 @@ no third-party libraries for the server, the tests, or CI.
 
 ### Not there yet
 
-- [ ] `MULTI` / `EXEC` / `WATCH`
-- [ ] RDB persistence — in the real format, so files are portable
-- [ ] AOF with rewrite
-- [ ] Replication over `PSYNC`
+- [ ] Bitmaps, `HSCAN`/`SSCAN`/`ZSCAN`, `SORT`, hash-field TTL
+- [ ] HyperLogLog and the geo commands
+- [ ] Blocking commands — `BLPOP`, `BZPOPMIN`, `BLMPOP`
+- [ ] Streams, with consumer groups
+- [ ] Command propagation, then AOF with rewrite, then replication over `PSYNC`
 - [ ] The MCP server
 
 Until then, any command that isn't implemented returns an unknown-command
@@ -152,13 +163,16 @@ both, and compares every reply. Unit tests can only show that mnemos agrees
 with itself; this shows it agrees with the thing it's imitating, including on
 edge cases nobody thinks to write a test for — negative `LREM` counts,
 `ZADD GT/LT`, exclusive score ranges, `WRONGTYPE` on every command, and the
-rule that a collection is deleted once its last element is removed. Pub/sub is
-covered the same way, over two connections per server, so a delivered message
-has to arrive on the right one with the right framing. All 46 suites match byte
-for byte against Redis 8.10.1; a suite that depends on behaviour newer than the
+rule that a collection is deleted once its last element is removed. Pub/sub and
+transactions are covered the same way, over two connections per server, so a
+delivered message has to arrive on the right one with the right framing and a
+`WATCH` has to notice the other connection's write. All 85 suites match byte for
+byte against Redis 8.10.1; a suite that depends on behaviour newer than the
 reference server is skipped and counted, never quietly passed.
 
-The interop suite adds 51 assertions driven through the genuine `redis-cli`.
+The interop suite adds 75 assertions driven through the genuine `redis-cli`,
+two of which hand an RDB file between mnemos and a real `redis-server` in each
+direction.
 Unit tests cover protocol parsing under byte-by-byte fragmentation, `SCAN`
 during a rehash, skiplist ranks cross-checked against a sorted reference, and
 the listpack and intset formats against bytes extracted from a real Redis via
@@ -173,9 +187,9 @@ UndefinedBehaviorSanitizer.
 src/net/       event loop, RESP parsing and serialisation
 src/core/      value objects, encodings, listpack, intset, skiplist, dict
 src/server/    server, connections, databases, commands
-src/persist/   RDB and AOF                          (in progress)
-src/repl/      replication                          (in progress)
-src/mcp/       MCP server                           (in progress)
+src/persist/   the RDB codec: CRC64, LZF, objects, whole files
+src/repl/      replication                          (not started)
+src/mcp/       MCP server                           (designed, not started)
 tests/         unit tests
 scripts/       check.sh, interop and differential suites
 ```
