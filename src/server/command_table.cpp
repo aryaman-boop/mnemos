@@ -186,6 +186,16 @@ const std::vector<CommandSpec>& table() {
         // Two keys, destination first: ZRANGESTORE is the only zset command a
         // cluster proxy has to route on more than one.
         {"zrangestore",   cmd::zrangestore,        -5,  kWrite,                       1,  2,  1},
+        // The set operations take their keys from a numkeys count, so the static
+        // key positions cover only what is fixed: the destination, or nothing.
+        {"zunion",        cmd::zunion,             -3,  kReadOnly,                    0,  0,  0},
+        {"zinter",        cmd::zinter,             -3,  kReadOnly,                    0,  0,  0},
+        {"zdiff",         cmd::zdiff,              -3,  kReadOnly,                    0,  0,  0},
+        {"zunionstore",   cmd::zunionstore,        -4,  kWrite,                       1,  1,  1},
+        {"zinterstore",   cmd::zinterstore,        -4,  kWrite,                       1,  1,  1},
+        {"zdiffstore",    cmd::zdiffstore,         -4,  kWrite,                       1,  1,  1},
+        {"zintercard",    cmd::zintercard,         -3,  kReadOnly,                    0,  0,  0},
+        {"zmpop",         cmd::zmpop,              -4,  kWrite,                       0,  0,  0},
     };
     return commands;
 }

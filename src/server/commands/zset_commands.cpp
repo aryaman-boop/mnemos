@@ -3,6 +3,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <random>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "core/strings.h"
 #include "server/commands/commands.h"
@@ -691,6 +693,355 @@ void zrangestore(CommandContext& ctx) {
     ctx.server.markDirty(items.size());
     notifyKeyspaceEvent(ctx, notify::kZset, "zrangestore", destination);
     ctx.reply.integer(static_cast<std::int64_t>(items.size()));
+}
+
+
+namespace {
+
+enum class ZSetOp { Union, Intersect, Difference };
+enum class Aggregate { Sum, Min, Max };
+
+// One input to the set operations. They accept plain sets as well as sorted
+// ones -- a set member enters with a score of 1, which its weight then
+// multiplies like any other -- so this is the flattened form both reduce to.
+struct ZSetSource {
+    std::vector<std::pair<std::string, double>> members;
+    double                                      weight = 1.0;
+};
+
+// Reads `count` keys starting at `first`. A missing key is an empty input
+// rather than an error, which is why ZINTERSTORE over a nonexistent key stores
+// nothing instead of failing.
+bool gatherZSetSources(CommandContext& ctx, std::size_t first, std::size_t count,
+                       std::vector<ZSetSource>& out) {
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::string& key = ctx.arg(first + i);
+        ZSetSource source;
+        Value* value = ctx.db.lookupRead(key, ctx.nowMs());
+        if (!value) {
+            notifyKeyMiss(ctx, key);
+        } else if (value->type() == ObjType::ZSet) {
+            source.members = value->zset()->all();
+        } else if (value->type() == ObjType::Set) {
+            for (const std::string& member : value->set()->members()) {
+                source.members.emplace_back(member, 1.0);
+            }
+        } else {
+            replies::wrongType(ctx.reply);
+            return false;
+        }
+        out.push_back(std::move(source));
+    }
+    return true;
+}
+
+// Summing an infinity with its opposite gives a NaN, which is not a score any
+// sorted set can hold. Redis flattens it to zero at both points one can appear:
+// after the weight multiplication (0 * inf) and after each SUM step.
+double weighted(double score, double weight) {
+    const double product = score * weight;
+    return std::isnan(product) ? 0.0 : product;
+}
+
+double aggregateScores(Aggregate how, double accumulated, double incoming) {
+    switch (how) {
+        case Aggregate::Sum: {
+            const double sum = accumulated + incoming;
+            return std::isnan(sum) ? 0.0 : sum;
+        }
+        case Aggregate::Min: return std::min(accumulated, incoming);
+        case Aggregate::Max: return std::max(accumulated, incoming);
+    }
+    return accumulated;
+}
+
+// `limit` stops an intersection early once that many members are known, which
+// only ZINTERCARD wants -- it reads the size and never the members. Takes
+// `sources` by reference because the intersection reorders them.
+std::vector<std::pair<std::string, double>> applyZSetOp(ZSetOp op,
+                                                        std::vector<ZSetSource>& sources,
+                                                        Aggregate how, std::size_t limit) {
+    std::vector<std::pair<std::string, double>> result;
+    if (sources.empty()) return result;
+
+    if (op == ZSetOp::Union) {
+        std::unordered_map<std::string, double> totals;
+        for (const ZSetSource& source : sources) {
+            for (const auto& [member, score] : source.members) {
+                const double value = weighted(score, source.weight);
+                auto [slot, inserted] = totals.try_emplace(member, value);
+                if (!inserted) slot->second = aggregateScores(how, slot->second, value);
+            }
+        }
+        result.assign(totals.begin(), totals.end());
+    } else if (op == ZSetOp::Intersect) {
+        // Smallest first: the result cannot outgrow it, so this bounds the
+        // probes. It also fixes the order the scores aggregate in, and Redis
+        // sorts by cardinality for the same reason -- which matters, because a
+        // SUM that passes through a NaN depends on where the NaN falls.
+        std::stable_sort(sources.begin(), sources.end(),
+                         [](const ZSetSource& a, const ZSetSource& b) {
+                             return a.members.size() < b.members.size();
+                         });
+        std::vector<std::unordered_map<std::string, double>> others;
+        for (std::size_t i = 1; i < sources.size(); ++i) {
+            others.emplace_back(sources[i].members.begin(), sources[i].members.end());
+        }
+        for (const auto& [member, score] : sources.front().members) {
+            double total = weighted(score, sources.front().weight);
+            bool in_all = true;
+            for (std::size_t i = 0; i < others.size(); ++i) {
+                const auto found = others[i].find(member);
+                if (found == others[i].end()) {
+                    in_all = false;
+                    break;
+                }
+                total = aggregateScores(how, total, weighted(found->second, sources[i + 1].weight));
+            }
+            if (!in_all) continue;
+            result.emplace_back(member, total);
+            if (limit > 0 && result.size() >= limit) return result;
+        }
+    } else {
+        // Difference keeps the first input's scores untouched: it takes neither
+        // weights nor an aggregate, because nothing is ever combined.
+        std::vector<std::unordered_set<std::string>> others;
+        for (std::size_t i = 1; i < sources.size(); ++i) {
+            std::unordered_set<std::string> seen;
+            for (const auto& [member, score] : sources[i].members) seen.insert(member);
+            others.push_back(std::move(seen));
+        }
+        for (const auto& entry : sources.front().members) {
+            bool excluded = false;
+            for (const auto& other : others) {
+                if (other.count(entry.first)) {
+                    excluded = true;
+                    break;
+                }
+            }
+            if (!excluded) result.push_back(entry);
+        }
+    }
+
+    // Redis accumulates into a real sorted set and reads it back out, so the
+    // reply is in (score, member) order however the inputs were given.
+    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second) return a.second < b.second;
+        return a.first < b.first;
+    });
+    return result;
+}
+
+std::string_view zsetOpName(ZSetOp op, bool store) {
+    switch (op) {
+        case ZSetOp::Union:      return store ? "zunionstore" : "zunion";
+        case ZSetOp::Intersect:  return store ? "zinterstore" : "zinter";
+        case ZSetOp::Difference: return store ? "zdiffstore" : "zdiff";
+    }
+    return "";
+}
+
+// The numkeys preamble every set operation shares. Three distinct errors, in
+// Redis's order: a count that is not a number at all, one below 1, and one that
+// claims more keys than were sent -- which is only ever a syntax error, however
+// far out it is.
+bool parseNumkeys(CommandContext& ctx, std::size_t index, std::string_view command,
+                  std::int64_t& numkeys) {
+    if (!stringToInt64(ctx.arg(index), numkeys)) {
+        replies::notAnInteger(ctx.reply);
+        return false;
+    }
+    if (numkeys < 1) {
+        ctx.reply.error("ERR at least 1 input key is needed for '" + std::string(command) +
+                        "' command");
+        return false;
+    }
+    if (static_cast<std::size_t>(numkeys) > ctx.argc() - (index + 1)) {
+        replies::syntaxError(ctx.reply);
+        return false;
+    }
+    return true;
+}
+
+void zsetOpCommand(CommandContext& ctx, ZSetOp op, bool store) {
+    const std::size_t numkeys_index = store ? 2 : 1;
+    std::int64_t numkeys = 0;
+    if (!parseNumkeys(ctx, numkeys_index, zsetOpName(op, store), numkeys)) return;
+    const std::size_t first_key = numkeys_index + 1;
+
+    // Keys before options, which is the order Redis checks them in: a WRONGTYPE
+    // among the inputs beats a syntax error in the trailing arguments.
+    std::vector<ZSetSource> sources;
+    if (!gatherZSetSources(ctx, first_key, static_cast<std::size_t>(numkeys), sources)) return;
+
+    Aggregate how = Aggregate::Sum;
+    bool with_scores = false;
+    std::vector<double> weights(static_cast<std::size_t>(numkeys), 1.0);
+    for (std::size_t i = first_key + static_cast<std::size_t>(numkeys); i < ctx.argc(); ++i) {
+        const std::string& token = ctx.arg(i);
+        if (op != ZSetOp::Difference && equalsIgnoreCase(token, "WEIGHTS") &&
+            i + static_cast<std::size_t>(numkeys) < ctx.argc()) {
+            for (std::size_t w = 0; w < static_cast<std::size_t>(numkeys); ++w) {
+                if (!parseScore(ctx.arg(i + 1 + w), weights[w])) {
+                    ctx.reply.error("ERR weight value is not a float");
+                    return;
+                }
+            }
+            i += static_cast<std::size_t>(numkeys);
+        } else if (op != ZSetOp::Difference && equalsIgnoreCase(token, "AGGREGATE") &&
+                   i + 1 < ctx.argc()) {
+            const std::string& mode = ctx.arg(i + 1);
+            if (equalsIgnoreCase(mode, "SUM")) {
+                how = Aggregate::Sum;
+            } else if (equalsIgnoreCase(mode, "MIN")) {
+                how = Aggregate::Min;
+            } else if (equalsIgnoreCase(mode, "MAX")) {
+                how = Aggregate::Max;
+            } else {
+                replies::syntaxError(ctx.reply);
+                return;
+            }
+            ++i;
+        } else if (!store && equalsIgnoreCase(token, "WITHSCORES")) {
+            with_scores = true;
+        } else {
+            replies::syntaxError(ctx.reply);
+            return;
+        }
+    }
+    for (std::size_t i = 0; i < sources.size(); ++i) sources[i].weight = weights[i];
+
+    std::vector<std::pair<std::string, double>> result = applyZSetOp(op, sources, how, 0);
+
+    if (!store) {
+        emitMembers(ctx, result, with_scores);
+        return;
+    }
+
+    const std::string& destination = ctx.arg(1);
+    if (!result.empty()) {
+        // setKey rather than erase-then-create: it drops the old TTL the same
+        // way, but only announces `new` when the destination really is new.
+        ctx.db.setKey(destination, Value::makeZSet());
+        Value* stored = ctx.db.lookupWrite(destination, ctx.nowMs());
+        for (const auto& [member, score] : result) stored->zset()->add(member, score);
+        notifyKeyspaceEvent(ctx, notify::kZset, zsetOpName(op, true), destination);
+    } else if (ctx.db.erase(destination)) {
+        // An empty result is a delete, and that is the only event it raises.
+        notifyKeyspaceEvent(ctx, notify::kGeneric, "del", destination);
+    }
+    ctx.server.markDirty();
+    ctx.reply.integer(static_cast<std::int64_t>(result.size()));
+}
+
+}  // namespace
+
+void zunion(CommandContext& ctx)      { zsetOpCommand(ctx, ZSetOp::Union, false); }
+void zinter(CommandContext& ctx)      { zsetOpCommand(ctx, ZSetOp::Intersect, false); }
+void zdiff(CommandContext& ctx)       { zsetOpCommand(ctx, ZSetOp::Difference, false); }
+void zunionstore(CommandContext& ctx) { zsetOpCommand(ctx, ZSetOp::Union, true); }
+void zinterstore(CommandContext& ctx) { zsetOpCommand(ctx, ZSetOp::Intersect, true); }
+void zdiffstore(CommandContext& ctx)  { zsetOpCommand(ctx, ZSetOp::Difference, true); }
+
+void zintercard(CommandContext& ctx) {
+    std::int64_t numkeys = 0;
+    if (!parseNumkeys(ctx, 1, "zintercard", numkeys)) return;
+
+    std::size_t limit = 0;  // 0 means unlimited
+    const std::size_t after_keys = 2 + static_cast<std::size_t>(numkeys);
+    if (ctx.argc() > after_keys) {
+        if (!equalsIgnoreCase(ctx.arg(after_keys), "LIMIT") || ctx.argc() != after_keys + 2) {
+            replies::syntaxError(ctx.reply);
+            return;
+        }
+        std::int64_t parsed = 0;
+        if (!stringToInt64(ctx.arg(after_keys + 1), parsed) || parsed < 0) {
+            ctx.reply.error("ERR LIMIT can't be negative");
+            return;
+        }
+        limit = static_cast<std::size_t>(parsed);
+    }
+
+    std::vector<ZSetSource> sources;
+    if (!gatherZSetSources(ctx, 2, static_cast<std::size_t>(numkeys), sources)) return;
+    ctx.reply.integer(static_cast<std::int64_t>(
+        applyZSetOp(ZSetOp::Intersect, sources, Aggregate::Sum, limit).size()));
+}
+
+void zmpop(CommandContext& ctx) {
+    std::int64_t numkeys = 0;
+    if (!stringToInt64(ctx.arg(1), numkeys) || numkeys <= 0) {
+        ctx.reply.error("ERR numkeys should be greater than 0");
+        return;
+    }
+    if (numkeys >= static_cast<std::int64_t>(ctx.argc())) {
+        replies::syntaxError(ctx.reply);
+        return;
+    }
+    const std::size_t where_index = 2 + static_cast<std::size_t>(numkeys);
+    if (where_index >= ctx.argc()) {
+        replies::syntaxError(ctx.reply);
+        return;
+    }
+    bool lowest = true;
+    if (equalsIgnoreCase(ctx.arg(where_index), "MIN")) {
+        lowest = true;
+    } else if (equalsIgnoreCase(ctx.arg(where_index), "MAX")) {
+        lowest = false;
+    } else {
+        replies::syntaxError(ctx.reply);
+        return;
+    }
+
+    std::int64_t count = 1;
+    if (ctx.argc() > where_index + 1) {
+        if (!equalsIgnoreCase(ctx.arg(where_index + 1), "COUNT") ||
+            ctx.argc() != where_index + 3) {
+            replies::syntaxError(ctx.reply);
+            return;
+        }
+        if (!stringToInt64(ctx.arg(where_index + 2), count) || count <= 0) {
+            ctx.reply.error("ERR count should be greater than 0");
+            return;
+        }
+    }
+
+    // The first key holding anything wins outright and the rest are never
+    // examined: ZMPOP's key list is a preference order, not a set to merge.
+    for (std::size_t i = 2; i < where_index; ++i) {
+        const std::string& key = ctx.arg(i);
+        bool type_error = false;
+        Value* value = lookupTyped(ctx, key, ObjType::ZSet, type_error);
+        if (type_error) return;
+        if (!value || value->zset()->size() == 0) continue;
+
+        std::vector<std::pair<std::string, double>> all = value->zset()->all();
+        if (!lowest) std::reverse(all.begin(), all.end());
+        const auto wanted = std::min<std::size_t>(static_cast<std::size_t>(count), all.size());
+        std::vector<std::pair<std::string, double>> popped(
+            all.begin(), all.begin() + static_cast<std::ptrdiff_t>(wanted));
+        for (const auto& [member, score] : popped) value->zset()->erase(member);
+        ctx.server.markDirty(popped.size());
+        notifyKeyspaceEvent(ctx, notify::kZset, lowest ? "zpopmin" : "zpopmax", key);
+        deleteIfEmpty(ctx, key, *value);
+
+        ctx.reply.arrayHeader(2);
+        ctx.reply.bulk(key);
+        ctx.reply.arrayHeader(static_cast<std::int64_t>(popped.size()));
+        for (const auto& [member, score] : popped) {
+            ctx.reply.arrayHeader(2);
+            ctx.reply.bulk(member);
+            if (ctx.reply.protocolVersion() >= 3) {
+                ctx.reply.doubleValue(score);
+            } else {
+                ctx.reply.bulk(net::formatDouble(score));
+            }
+        }
+        return;
+    }
+    // Nothing anywhere is a null array, not an empty one -- the same shape the
+    // blocking form returns on timeout.
+    ctx.reply.nullArray();
 }
 
 }  // namespace mnemos::server::cmd

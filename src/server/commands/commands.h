@@ -160,6 +160,14 @@ void zrevrangebylex(CommandContext&);
 void zlexcount(CommandContext&);
 void zremrangebylex(CommandContext&);
 void zrangestore(CommandContext&);
+void zunion(CommandContext&);
+void zinter(CommandContext&);
+void zdiff(CommandContext&);
+void zunionstore(CommandContext&);
+void zinterstore(CommandContext&);
+void zdiffstore(CommandContext&);
+void zintercard(CommandContext&);
+void zmpop(CommandContext&);
 
 // --- persist_commands.cpp ---------------------------------------------------
 void dump(CommandContext&);
