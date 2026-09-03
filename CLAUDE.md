@@ -191,9 +191,11 @@ before the thing it consumes means building that thing twice.
 
 In order:
 
-1. ZSET completion -- lex ranges and the modern `ZRANGE` argument forms
-   first, then the set ops (`ZUNIONSTORE` and family), `ZMPOP`, `ZINTERCARD`.
-   No new infrastructure; every command follows a pattern already in the file.
+1. ~~ZSET completion~~ **done** -- lex ranges and the modern `ZRANGE` forms
+   (`258b46d`), then the set ops, `ZMPOP` and `ZINTERCARD` (`8dd4c0c`). What
+   is left of the family belongs to later items: `ZSCAN` to 3, the blocking
+   pops to 8. Numbering below is left as it was so the constraints still name
+   the right items.
 2. Bitmaps -- `SETBIT` through `BITFIELD`, whose type/overflow grammar is the
    real work.
 3. Cursor scans -- `HSCAN`, `SSCAN`, `ZSCAN`. Needs a reverse-binary cursor
