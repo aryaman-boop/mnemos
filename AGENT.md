@@ -7,12 +7,12 @@ dependencies — server, tests and CI use only the standard library and CMake.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo   # once
-./scripts/check.sh                                      # build + all three suites
+./scripts/check.sh                                      # build + every suite
 ```
 
 **`./scripts/check.sh` is the verification command.** It configures, builds, and
-runs unit tests, the interop suite and the differential suite in one pass, and
-prints only failures plus a summary. Do not run the steps separately — one
+runs unit tests, the interop suite, the differential suite and the MCP suite
+in one pass, and prints only failures plus a summary. Do not run the steps separately — one
 command means one round trip.
 
 ```bash
@@ -21,8 +21,9 @@ command means one round trip.
 ./scripts/check.sh --sanitize  # Debug + asan/ubsan build in build-asan/
 ```
 
-Needs `redis-server` and `redis-cli` on PATH for the interop and differential
-suites (`brew install redis`). Without them those suites are skipped, not failed.
+Needs `redis-server` and `redis-cli` on PATH for the interop, differential and
+MCP suites (`brew install redis`). Without them those suites are skipped, not
+failed.
 
 ## The correctness bar
 
@@ -212,6 +213,13 @@ differential half of `scripts/mcp_test.py` comes from.
   shown to be safe. It also hides `set` from `tools/list`.
 - Tool results are one serialised JSON object each, so a model gets the same
   shape back whichever tool it called.
+- **The differential half is gated like the main one.** A `DIFF_CALLS` entry is
+  `(name, tool, arguments)` with an optional fourth element: the earliest
+  reference redis its answer can be compared against. The version is read
+  through the `server_info` tool, and a gated call is skipped, printed and kept
+  out of the totals. `describe_key` on a small list or non-integer set needs
+  `(7, 2)` — listpack collections — and the ubuntu runner ships 7.0.15, so any
+  new call that reports an encoding needs the same gate.
 
 ## Roadmap
 

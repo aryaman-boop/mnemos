@@ -43,9 +43,13 @@ twice.
 
 - [ ] `mnemos-mcp` declares only the `tools` capability. `resources/` (a key as
       a resource) and `prompts/` are unimplemented, and nothing needs them yet.
-- [ ] The MCP differential suite avoids `server_info` (versions differ by
-      construction) and normalises TTLs away. Keep new cases under the encoding
-      thresholds so the encodings stay comparable.
+- [ ] The MCP differential suite never *compares* `server_info` (versions differ
+      by construction) though it does read the reference's version through it,
+      and it normalises TTLs away. Keep new cases under the encoding thresholds
+      so the encodings stay comparable — and note that comparable there means
+      comparable against redis 7.0.15, which is what the ubuntu runner ships:
+      a call reporting a list or non-integer set encoding needs the fourth
+      `DIFF_CALLS` element, `(7, 2)`.
 - [ ] Renaming `CLAUDE.md` to `AGENT.md` means Claude Code no longer loads it
       automatically. Symlink it back, or point at it explicitly, if that
       auto-loading is wanted.

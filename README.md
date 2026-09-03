@@ -181,6 +181,7 @@ run standalone:
 ctest --test-dir build --output-on-failure   # unit tests
 ./scripts/interop_test.sh                    # drives the real redis-cli
 ./scripts/differential_test.sh               # compares against a real redis-server
+python3 ./scripts/mcp_test.py                # drives mnemos-mcp over JSON-RPC
 ```
 
 The **differential test** is the one that matters most: it starts mnemos and a
@@ -196,6 +197,13 @@ delivered message has to arrive on the right one with the right framing and a
 byte against Redis 8.10.1; a suite that depends on behaviour newer than the
 reference server is skipped and counted, never quietly passed.
 
+The **MCP suite** works the same way. `mnemos-mcp` is a RESP client, so the
+identical tool calls are pointed at a real `redis-server` and the resulting
+JSON compared — an oracle for everything except the MCP framing itself, which
+the same 107 checks cover directly: both handshake eras, the two error
+channels, `tools/list` schema validity, every tool's happy path and the
+`--read-only` gate.
+
 The interop suite adds 75 assertions driven through the genuine `redis-cli`,
 two of which hand an RDB file between mnemos and a real `redis-server` in each
 direction.
@@ -205,7 +213,10 @@ the listpack and intset formats against bytes extracted from a real Redis via
 `DUMP`.
 
 CI runs everything on Linux and macOS, plus a pass under AddressSanitizer and
-UndefinedBehaviorSanitizer.
+UndefinedBehaviorSanitizer. The two runners ship different reference Redis
+versions, so both the differential and the MCP suites skip and count the cases
+their reference is too old to answer — a check that cannot be compared is never
+quietly passed.
 
 ## Layout
 
