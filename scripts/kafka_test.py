@@ -26,6 +26,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import traceback
 import time
 
 results = []
@@ -801,10 +802,9 @@ def test_pipelining(port):
 def test_partitions(port, build, workdir, mnemos_port):
     """A multi-partition topic: partitions are separate logs, and the count a
     topic is created with is the count it keeps."""
-    proc = subprocess.Popen(
-        [os.path.join(build, "mnemos-kafka"), "--port", str(port),
-         "--redis-port", str(mnemos_port), "--partitions", "3"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = spawn("kafka-partitions",
+                 [os.path.join(build, "mnemos-kafka"), "--port", str(port),
+                  "--redis-port", str(mnemos_port), "--partitions", "3"], workdir)
     try:
         if not wait_for_port(port):
             check("second broker starts", False, "no listener")
@@ -845,11 +845,10 @@ def test_partitions(port, build, workdir, mnemos_port):
             proc.kill()
 
 
-def test_no_auto_create(port, build, mnemos_port):
-    proc = subprocess.Popen(
-        [os.path.join(build, "mnemos-kafka"), "--port", str(port),
-         "--redis-port", str(mnemos_port), "--no-auto-create"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def test_no_auto_create(port, build, mnemos_port, workdir):
+    proc = spawn("kafka-no-auto-create",
+                 [os.path.join(build, "mnemos-kafka"), "--port", str(port),
+                  "--redis-port", str(mnemos_port), "--no-auto-create"], workdir)
     try:
         if not wait_for_port(port):
             check("--no-auto-create broker starts", False, "no listener")
@@ -882,6 +881,45 @@ def test_no_auto_create(port, build, mnemos_port):
 
 
 # ------------------------------------------------------------- process control
+# Every close the broker performs says why on stderr, so that stream is the
+# only account of a connection that hung up. Discarding it costs a CI round
+# trip to diagnose a failure that the process already explained.
+process_logs = []
+process_output = []
+
+
+def spawn(label, argv, log_dir):
+    path = os.path.join(log_dir, label + ".stderr")
+    handle = open(path, "wb")
+    proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=handle)
+    process_logs.append((label, path, proc))
+    return proc
+
+
+def collect_process_output():
+    """Read the logs while they still exist: the workdir holds them, and the
+    suite removes it. A process still running here is one the suite expected
+    to be running, so only an early exit is worth saying out loud."""
+    for label, path, proc in process_logs:
+        status = proc.poll()
+        try:
+            with open(path, "rb") as handle:
+                text = handle.read().decode("utf-8", "replace")
+        except OSError:
+            text = ""
+        process_output.append((label, status, text))
+
+
+def report_process_output():
+    for label, status, text in process_output:
+        if status is not None and status != -signal.SIGTERM:
+            how = (f"killed by signal {-status}" if status < 0
+                   else f"exited with status {status}")
+            print(f"  {label}: {how} before the suite was done with it")
+        for line in text.splitlines()[-20:]:
+            print(f"  {label}: {line}")
+
+
 def wait_for_port(port, seconds=5.0):
     deadline = time.time() + seconds
     while time.time() < deadline:
@@ -932,33 +970,43 @@ def main():
     workdir = tempfile.mkdtemp()
     processes = []
     try:
-        processes.append(subprocess.Popen(
-            [server_binary, "--port", str(args.mnemos_port), "--dir", workdir],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        processes.append(spawn(
+            "mnemos-server",
+            [server_binary, "--port", str(args.mnemos_port), "--dir", workdir], workdir))
         if not wait_for_port(args.mnemos_port):
             print("error: mnemos-server did not start", file=sys.stderr)
+            collect_process_output()
+            report_process_output()
             return 1
 
-        processes.append(subprocess.Popen(
+        processes.append(spawn(
+            "mnemos-kafka",
             [kafka_binary, "--port", str(args.kafka_port),
-             "--redis-port", str(args.mnemos_port)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+             "--redis-port", str(args.mnemos_port)], workdir))
         if not wait_for_port(args.kafka_port):
             print("error: mnemos-kafka did not start", file=sys.stderr)
+            collect_process_output()
+            report_process_output()
             return 1
 
-        test_api_versions(args.kafka_port)
-        test_unknown_api(args.kafka_port)
-        test_metadata(args.kafka_port, host, node_id, cluster_id)
-        test_produce_fetch(args.kafka_port)
-        test_produce_errors(args.kafka_port)
-        test_list_offsets(args.kafka_port)
-        test_long_poll(args.kafka_port)
-        test_pipelining(args.kafka_port)
-        test_partitions(extra_ports[0], build, workdir, args.mnemos_port)
-        test_no_auto_create(extra_ports[1], build, args.mnemos_port)
+        try:
+            test_api_versions(args.kafka_port)
+            test_unknown_api(args.kafka_port)
+            test_metadata(args.kafka_port, host, node_id, cluster_id)
+            test_produce_fetch(args.kafka_port)
+            test_produce_errors(args.kafka_port)
+            test_list_offsets(args.kafka_port)
+            test_long_poll(args.kafka_port)
+            test_pipelining(args.kafka_port)
+            test_partitions(extra_ports[0], build, workdir, args.mnemos_port)
+            test_no_auto_create(extra_ports[1], build, args.mnemos_port, workdir)
+        except Exception:
+            # A dropped connection aborts the suite, but it is a failed check
+            # like any other -- the broker's stderr below says what it was.
+            check("the suite runs to completion", False, traceback.format_exc())
     finally:
         signal.alarm(0)
+        collect_process_output()
         for proc in processes:
             proc.terminate()
             try:
@@ -976,6 +1024,7 @@ def main():
         for line in detail.splitlines():
             print(f"           {line}")
     if failures:
+        report_process_output()
         print(f"{len(failures)} of {len(results)} checks failed")
         return 1
     print(f"all {len(results)} checks passed")

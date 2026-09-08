@@ -11,6 +11,7 @@
 // is the same trade mnemos-mcp makes and is bounded by the socket timeout.
 #include <arpa/inet.h>
 #include <cerrno>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -196,7 +197,12 @@ void KafkaServer::drainRequests(Conn& conn) {
         std::string frame(conn.in, conn.in_pos + kFrameHeader, size);
         conn.in_pos += kFrameHeader + size;
 
-        if (!applyOutcome(conn, broker_.handleRequest(frame, true), std::move(frame))) return;
+        // Sequenced deliberately: writing this as one call would leave the
+        // order of `handleRequest(frame)` and the move of `frame` into the
+        // parameter unspecified, and a compiler that evaluates right to left
+        // then hands the broker an empty frame.
+        Broker::Outcome outcome = broker_.handleRequest(frame, true);
+        if (!applyOutcome(conn, std::move(outcome), std::move(frame))) return;
     }
 
     // Compact once the cursor has run well ahead, rather than on every frame.
@@ -401,6 +407,11 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+
+    // A client that hangs up while a response is being written would otherwise
+    // take the broker down with it: SIGPIPE's default action is to terminate.
+    // mnemos-server does the same, in src/main.cpp.
+    std::signal(SIGPIPE, SIG_IGN);
 
     config.advertised_host = advertised.empty() ? bind_address : advertised;
 

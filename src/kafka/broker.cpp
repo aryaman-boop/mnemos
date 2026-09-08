@@ -97,6 +97,11 @@ Broker::Outcome Broker::handleRequest(std::string_view frame, bool allow_wait) {
     Reader        r(frame);
     RequestHeader header;
     if (!parseRequestHeader(r, header)) {
+        // Every other close below says why on stderr, and this one has to as
+        // well: a silent hang-up is indistinguishable from a crash to whoever
+        // is holding the other end of the socket.
+        std::fprintf(stderr, "mnemos-kafka: unparseable request header in %zu bytes\n",
+                     frame.size());
         outcome.kind = Outcome::Kind::Close;
         return outcome;
     }
