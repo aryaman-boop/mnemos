@@ -11,8 +11,8 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo   # once
 ```
 
 **`./scripts/check.sh` is the verification command.** It configures, builds, and
-runs unit tests, the interop suite, the differential suite and the MCP suite
-in one pass, and prints only failures plus a summary. Do not run the steps separately — one
+runs unit tests, the interop suite, the differential suite, the MCP suite and
+the Kafka suite in one pass, and prints only failures plus a summary. Do not run the steps separately — one
 command means one round trip.
 
 ```bash
@@ -37,7 +37,8 @@ unit test. Error strings must be byte-identical to Redis's — use the helpers i
 `namespace replies` (`command_table.h`), never a hand-written string.
 
 The MCP server has its own suite, `scripts/mcp_test.py`, for the same reason
-and with the same oracle — see *MCP*.
+and with the same oracle — see *MCP*. The Kafka server has `scripts/kafka_test.py`,
+which has **no** oracle and says so — see *Kafka*.
 
 A suite is `(name, commands, flags)`. The flags that exist:
 
@@ -63,15 +64,18 @@ src/server/    server, connections, databases, command dispatch
 src/server/commands/   one file per command family
 src/client/    a blocking RESP client (mnemos-mcp now, the replica link later)
 src/mcp/       the MCP server: JSON, JSON-RPC, tools
+src/kafka/     the Kafka broker: wire codec, record batches, partition log
 tests/         unit tests (ctest, harness in tests/test_harness.h)
-scripts/       interop + differential + MCP suites
+scripts/       interop + differential + MCP + Kafka suites
 ```
 
 `CMakeLists.txt` globs `src/**/*.cpp` with `CONFIGURE_DEPENDS` — new source
 files need no build-file edit. `src/repl/` is already wired in the glob and
-will build as soon as it contains sources. `src/mcp/` is *not* in that glob: it
-builds only into the `mnemos-mcp` binary, so anything the server needs too
-belongs in `src/client/` instead.
+will build as soon as it contains sources. `src/mcp/` and `src/kafka/` are
+*not* in that glob: each builds only into its own binary, so anything the server
+needs too belongs in `src/client/` instead. A test over either has to name the
+translation units it exercises directly, the way `test_json` and
+`test_kafka_wire` do in `tests/CMakeLists.txt`.
 
 ## Adding a command
 
@@ -221,6 +225,60 @@ differential half of `scripts/mcp_test.py` comes from.
   `(7, 2)` — listpack collections — and the ubuntu runner ships 7.0.15, so any
   new call that reports an encoding needs the same gate.
 
+## Kafka
+
+`mnemos-kafka` is a third binary and, like `mnemos-mcp`, a **client of the
+server**: it speaks the Kafka wire protocol to producers and consumers on one
+side and RESP to `mnemos-server` on the other. Two processes must be running.
+A partition is a mnemos list, one record per element, so **an offset is a list
+index** — `RPUSH` appends and `LRANGE` answers a fetch with no index layer in
+between. That holds only because nothing pops; roadmap item 9's streams are
+what replaces it, behind the same `PartitionLog` interface.
+
+- **Only the non-flexible protocol versions are spoken, deliberately.** Every
+  maximum in `kApis` (`broker.cpp`) is one below the version where that API
+  grew tagged fields, so compact types and tagged fields never reach the wire.
+  Clients negotiate down through ApiVersions, so this costs compatibility with
+  nothing. Raising one maximum means implementing the flexible encoding for
+  every API, which is why the table carries the flexible-at version in a
+  comment beside each entry.
+- **ApiVersions is the one API that answers an unsupported version** rather
+  than closing, and it always frames its response with header v0 — even at v3,
+  where the request itself is flexible. That reply is how a newer client learns
+  what to downgrade to, so it is load-bearing rather than a courtesy.
+  Everything else that cannot be answered — an unknown API key, a version
+  outside the advertised range — closes the connection, because the response
+  schema is precisely what is unknown and closing is the only thing that leaves
+  the client's stream coherent.
+- **`acks=0` gets no reply at all.** The producer is not reading one, so a
+  response would be consumed as the answer to whatever it asks next. That is
+  the `Outcome::Kind::Silence` case.
+- **Compression is declined, not approximated.** A non-zero codec in the batch
+  attributes is `UNSUPPORTED_COMPRESSION_TYPE` (76). Gzip, snappy, lz4 and zstd
+  are four dependencies, and the zero-dependency rule outranks the convenience.
+- **A record batch is v2 only, and the CRC is CRC-32C** (Castagnoli, reflected
+  `0x82f63b78`) over everything from `attributes` onward — byte 21 of the
+  61-byte header. It is *not* the CRC-64 in `src/persist/`. Records are stored
+  individually, not as whole batches, which is what keeps an offset an index.
+- **A waiting fetch is parked, not spun.** A fetch that finds less than
+  `min_bytes` keeps its raw frame and is re-run on a 25 ms event-loop timer
+  until data arrives or `max_wait_ms` (capped at 30 s) passes. Safe only
+  because Fetch is a read. A parked fetch holds the connection's pipeline so
+  responses stay in request order. This is a poll; roadmap item 8's ready-key
+  registry is what deletes the timer rather than shrinks it.
+- **Consumer groups are not implemented**, and are not stubbed either. A
+  broker that answers FindCoordinator and then never completes a rebalance
+  makes a consumer hang instead of fail, which is worse than an unknown API
+  key. `--group.id` consumers do not work; assign-and-poll consumers do.
+- **The suite has no oracle, and this is the one place in the repo that is
+  true.** A reference broker is a JVM, and a pip-installed client library would
+  make CI test whatever version resolved that day. `scripts/kafka_test.py` is
+  therefore a second implementation of the protocol written from the spec — its
+  own CRC, varints, batch codec and framing — and a shared misreading of the
+  spec is the one class of bug it cannot catch. `tests/test_kafka_wire.cpp`
+  covers the codec directly, including CRC coverage and the corrupt, compressed
+  and truncated batch paths.
+
 ## Roadmap
 
 Roughly 110 in-scope commands remain of ~250. The order below is not
@@ -265,7 +323,12 @@ In order:
 11. ~~The MCP server~~ **done**. See *MCP*. It turned out to have an oracle
     after all: it is a RESP client, so the same tool calls run against a real
     redis and the JSON is compared (`scripts/mcp_test.py`).
-12. ACL, `CLIENT KILL`/`UNBLOCK`/`PAUSE`/`TRACKING`, `SLOWLOG`, `LATENCY`,
+12. Kafka — *partly done*. `mnemos-kafka` serves the produce/consume path:
+    ApiVersions, Metadata, Produce, Fetch, ListOffsets. See *Kafka*. What is
+    left is consumer groups (FindCoordinator, JoinGroup, SyncGroup, Heartbeat,
+    OffsetCommit/Fetch, LeaveGroup) — a rebalance state machine wanting item
+    8's timer wheel — and moving the partition log onto item 9's streams.
+13. ACL, `CLIENT KILL`/`UNBLOCK`/`PAUSE`/`TRACKING`, `SLOWLOG`, `LATENCY`,
     `MONITOR`, and a single-node `CLUSTER` shim.
 
 **Explicit non-goals.** `EVAL`/`EVALSHA`/`FUNCTION`/`FCALL` need a Lua

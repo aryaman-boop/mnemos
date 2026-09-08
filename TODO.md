@@ -21,6 +21,8 @@ twice.
 
 - [x] ZSET completion — lex ranges, modern `ZRANGE`, set ops, `ZMPOP`, `ZINTERCARD`
 - [x] The MCP server — `mnemos-mcp`, six tools, `scripts/mcp_test.py`
+- [x] **Kafka, the produce/consume path** — `mnemos-kafka`, five APIs,
+      `scripts/kafka_test.py`. Consumer groups are still out; see below.
 - [ ] **Bitmaps** — `SETBIT` through `BITFIELD`. The type/overflow grammar is
       the real work.
 - [ ] **Cursor scans** — `HSCAN`, `SSCAN`, `ZSCAN`. Needs a reverse-binary
@@ -36,6 +38,9 @@ twice.
       then consumer groups. Large enough to split in two.
 - [ ] **The propagation layer**, then AOF with rewrite, then replication over
       `PSYNC` — itself split, full sync before backlog and partial resync.
+- [ ] **Kafka consumer groups** — FindCoordinator, JoinGroup, SyncGroup,
+      Heartbeat, OffsetCommit/Fetch, LeaveGroup. A rebalance state machine, so
+      it wants the timer wheel from blocking infrastructure first.
 - [ ] ACL, `CLIENT KILL`/`UNBLOCK`/`PAUSE`/`TRACKING`, `SLOWLOG`, `LATENCY`,
       `MONITOR`, and a single-node `CLUSTER` shim
 
@@ -50,6 +55,15 @@ twice.
       comparable against redis 7.0.15, which is what the ubuntu runner ships:
       a call reporting a list or non-integer set encoding needs the fourth
       `DIFF_CALLS` element, `(7, 2)`.
+- [ ] `mnemos-kafka` stores a partition as a mnemos list, so an offset is a
+      list index. That is exact only because nothing pops. Move it onto streams
+      once they exist — the `PartitionLog` interface is the seam.
+- [ ] `mnemos-kafka` declines every compression codec (`UNSUPPORTED_COMPRESSION_TYPE`).
+      Supporting one means writing that codec: gzip, snappy, lz4 or zstd.
+- [ ] The Kafka suite has no oracle. `scripts/kafka_test.py` is a second
+      implementation written from the spec, so a shared misreading of the spec
+      is the one class of bug it cannot catch. A real client library would be a
+      better oracle and a worse dependency.
 - [ ] Renaming `CLAUDE.md` to `AGENT.md` means Claude Code no longer loads it
       automatically. Symlink it back, or point at it explicitly, if that
       auto-loading is wanted.

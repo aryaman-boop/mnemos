@@ -25,3 +25,12 @@ add_executable(test_json test_json.cpp "${CMAKE_CURRENT_SOURCE_DIR}/../src/mcp/j
 target_link_libraries(test_json PRIVATE mnemos_core)
 target_include_directories(test_json PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME test_json COMMAND test_json)
+
+# src/kafka/ is outside the core glob too, so the wire tests compile the two
+# translation units they exercise directly -- the same shape as test_json.
+add_executable(test_kafka_wire test_kafka_wire.cpp
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/kafka/wire.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/kafka/records.cpp")
+target_link_libraries(test_kafka_wire PRIVATE mnemos_core)
+target_include_directories(test_kafka_wire PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME test_kafka_wire COMMAND test_kafka_wire)

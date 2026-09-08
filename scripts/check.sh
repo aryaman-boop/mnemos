@@ -97,6 +97,16 @@ if [[ $UNIT_ONLY -eq 0 ]]; then
         [[ $VERBOSE -eq 1 ]] || mcp_args+=(--quiet)
         run "mcp" python3 "${ROOT}/scripts/mcp_test.py" "${mcp_args[@]}"
     fi
+
+    # The Kafka suite needs no redis and no reference broker: it starts
+    # mnemos-server and mnemos-kafka and speaks the wire protocol itself.
+    if [[ ! -x "${BUILD}/mnemos-kafka" ]]; then
+        skip "kafka" "mnemos-kafka not built"
+    else
+        kafka_args=(--build "$BUILD")
+        [[ $VERBOSE -eq 1 ]] || kafka_args+=(--quiet)
+        run "kafka" python3 "${ROOT}/scripts/kafka_test.py" "${kafka_args[@]}"
+    fi
 fi
 
 # ---------------------------------------------------------------- summary

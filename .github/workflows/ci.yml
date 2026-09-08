@@ -51,6 +51,12 @@ jobs:
       - name: MCP tests
         run: python3 ./scripts/mcp_test.py
 
+      # No oracle here: a reference broker is a JVM. The suite is a second
+      # implementation of the Kafka protocol, written from the spec, driving a
+      # real socket against mnemos-kafka.
+      - name: Kafka tests
+        run: python3 ./scripts/kafka_test.py
+
   sanitizers:
     name: asan+ubsan
     runs-on: ubuntu-latest

@@ -8,6 +8,10 @@ assistant can inspect a running instance directly — read keys, watch encodings
 change, check what the event loop is doing. It is a RESP client, so you can
 point it at a real `redis-server` just as happily.
 
+And a Kafka broker, `mnemos-kafka`, which real Kafka producers and consumers
+connect to on port 9092 and which stores each partition in mnemos. The
+produce/consume path works today; consumer groups do not.
+
 ```console
 $ mnemos-server --port 6380
 mnemos 0.1.0 ready to accept connections on 127.0.0.1:6380
@@ -96,6 +100,27 @@ To register it with Claude Code:
 claude mcp add mnemos -- /path/to/mnemos/build/mnemos-mcp --port 6380
 ```
 
+The Kafka broker is a third binary, and a client of the server in the same way.
+Point a producer or an assign-and-poll consumer at it as you would any broker:
+
+```bash
+./build/mnemos-kafka --port 9092 --redis-port 6380 --partitions 3
+```
+
+```
+--bind <addr>         Address to bind (default 127.0.0.1)
+--port <n>            Kafka port to listen on (default 9092)
+--advertised <host>   Host to advertise in Metadata (default the bind address)
+--node-id <n>         Broker id (default 1)
+--cluster-id <s>      Cluster id (default mnemos-kafka)
+--partitions <n>      Partitions for an auto-created topic (default 1)
+--no-auto-create      Do not create a topic on first reference
+--redis-host <addr>   mnemos-server to store the log in (default 127.0.0.1)
+--redis-port <n>      mnemos-server port (default 6380)
+--db <n>              Database to SELECT after connecting (default 0)
+--timeout <ms>        Socket timeout (default 5000)
+```
+
 ## Features
 
 - **RESP2 and RESP3**, negotiated with `HELLO`. Pipelining, inline commands,
@@ -135,6 +160,14 @@ claude mcp add mnemos -- /path/to/mnemos/build/mnemos-mcp --port 6380
   encoding, and `--read-only` refuses anything that writes or administers,
   classifying commands through the server's own command table. Speaks both the
   `initialize` handshake and the 2026-07-28 revision's per-request `_meta`.
+- **A Kafka broker**, `mnemos-kafka`. ApiVersions, Metadata, Produce, Fetch and
+  ListOffsets, in the non-flexible protocol versions that clients negotiate down
+  to. Real v2 record batches with CRC-32C, headers, null keys and tombstones; a
+  partition is a mnemos list and an offset is an index into it; a fetch that
+  finds nothing is parked and woken rather than answered empty. Consumer groups
+  are not implemented, and are not stubbed either — a broker that answers
+  FindCoordinator and never finishes a rebalance hangs a consumer instead of
+  failing it.
 - **Keyspace notifications** — `notify-keyspace-events` with the whole class
   bitmask, publishing to `__keyspace@<db>__:<key>` and `__keyevent@<db>__:<event>`.
   The event names, the order two of them arrive in, which commands stay silent,
@@ -182,6 +215,7 @@ ctest --test-dir build --output-on-failure   # unit tests
 ./scripts/interop_test.sh                    # drives the real redis-cli
 ./scripts/differential_test.sh               # compares against a real redis-server
 python3 ./scripts/mcp_test.py                # drives mnemos-mcp over JSON-RPC
+python3 ./scripts/kafka_test.py              # speaks Kafka to mnemos-kafka
 ```
 
 The **differential test** is the one that matters most: it starts mnemos and a
@@ -203,6 +237,17 @@ JSON compared — an oracle for everything except the MCP framing itself, which
 the same 107 checks cover directly: both handshake eras, the two error
 channels, `tools/list` schema validity, every tool's happy path and the
 `--read-only` gate.
+
+The **Kafka suite** is the one place with no oracle, and it says so. A
+reference broker is a JVM, and a pip-installed client library would mean CI
+testing whatever version resolved that day, so `scripts/kafka_test.py` is a
+second implementation of the protocol written from the spec — its own CRC-32C,
+varints, record batch codec and framing — driving 87 checks against a real
+socket: version negotiation and the downgrade path, round trips through every
+record shape, corrupt and compressed and truncated batches, offset lookups by
+timestamp, long polling that wakes on a write, and pipelining across a parked
+fetch. A shared misreading of the spec is the one class of bug it cannot catch;
+`tests/test_kafka_wire.cpp` covers the codec directly with another 126.
 
 The interop suite adds 75 assertions driven through the genuine `redis-cli`,
 two of which hand an RDB file between mnemos and a real `redis-server` in each
@@ -228,8 +273,9 @@ src/persist/   the RDB codec: CRC64, LZF, objects, whole files
 src/client/    a blocking RESP client
 src/repl/      replication                          (not started)
 src/mcp/       the MCP server: JSON, JSON-RPC, tools
+src/kafka/     the Kafka broker: wire codec, record batches, partition log
 tests/         unit tests
-scripts/       check.sh, interop, differential and MCP suites
+scripts/       check.sh, interop, differential, MCP and Kafka suites
 ```
 
 ## License

@@ -46,6 +46,15 @@ if(MNEMOS_MCP_SOURCES)
     target_link_libraries(mnemos-mcp PRIVATE mnemos_core)
 endif()
 
+# src/kafka/ is outside the core glob for the same reason src/mcp/ is: it builds
+# into its own binary, so anything the server would also need belongs in
+# src/client/ instead.
+file(GLOB MNEMOS_KAFKA_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/kafka/*.cpp")
+if(MNEMOS_KAFKA_SOURCES)
+    add_executable(mnemos-kafka ${MNEMOS_KAFKA_SOURCES})
+    target_link_libraries(mnemos-kafka PRIVATE mnemos_core)
+endif()
+
 # ---------------------------------------------------------------------- tests
 include(CTest)
 if(BUILD_TESTING)
