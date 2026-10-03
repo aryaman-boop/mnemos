@@ -1,0 +1,6 @@
+# An allowlist: the image is built from the sources and nothing else, so local
+# build trees, git history and anything untracked never reach the daemon.
+*
+!CMakeLists.txt
+!include/
+!src/

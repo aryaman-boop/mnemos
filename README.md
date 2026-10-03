@@ -69,6 +69,39 @@ cmake --build build -j
 Needs a C++23 compiler (Clang 16+ / GCC 13+) and CMake 3.20+. Nothing else —
 no third-party libraries for the server, the tests, or CI.
 
+### Docker
+
+No compiler needed. The image holds all three binaries:
+
+```bash
+docker build -t mnemos .
+docker run -d -p 127.0.0.1:6380:6380 -v mnemos-data:/data mnemos
+```
+
+Or the server and the Kafka broker together:
+
+```bash
+docker compose up -d --build --wait     # mnemos on :6380, mnemos-kafka on :9092
+```
+
+Both ports are published on the host's loopback only. The `demo` profile adds
+`redis-cli` and `kcat` from their own images, so nothing needs installing:
+
+```bash
+docker compose run --rm redis-cli
+echo hello | docker compose run --rm -T kcat -P -t events -p 0
+docker compose run --rm kcat -C -t events -o beginning -e
+```
+
+`/data` is a volume, but mnemos has no save points: a snapshot is written by
+`SAVE` or `SHUTDOWN SAVE`, not by stopping the container. `mnemos-mcp` speaks
+stdio, so it runs as a one-off container on the compose network:
+
+```bash
+claude mcp add mnemos -- docker run -i --rm --network mnemos_default \
+    mnemos:local mnemos-mcp --host mnemos --read-only
+```
+
 ```
 --port <n>            Port to listen on (default 6380)
 --bind <addr>         Address to bind (default 127.0.0.1)

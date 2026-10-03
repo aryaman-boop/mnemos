@@ -1,0 +1,74 @@
+# docker compose up -d --build --wait
+#
+#   mnemos-server   localhost:6380
+#   mnemos-kafka    localhost:9092, storing its partitions in mnemos-server
+#
+# The demo profile adds real clients from their own images, so nothing needs
+# installing on the host:
+#
+#   docker compose run --rm redis-cli
+#   echo hello | docker compose run --rm -T kcat -P -t events -p 0
+#   docker compose run --rm kcat -C -t events -o beginning -e
+
+name: mnemos
+
+x-mnemos: &mnemos
+  build: .
+  image: mnemos:local
+  restart: unless-stopped
+
+services:
+  mnemos:
+    <<: *mnemos
+    command: ["mnemos-server", "--bind", "0.0.0.0", "--dir", "/data"]
+    # Host loopback only. mnemos has no password unless --requirepass is
+    # passed, so the port is not offered to the rest of the network.
+    ports: ["127.0.0.1:6380:6380"]
+    volumes: ["mnemos-data:/data"]
+
+  kafka:
+    <<: *mnemos
+    # mnemos-kafka installs no SIGTERM handler, and PID 1 gets no default
+    # action, so without an init `docker compose stop` waits out its timeout.
+    init: true
+    # Advertising localhost is right for clients on the host, through the
+    # published port. A client inside this network has to share the broker's
+    # network namespace for it to be right there too, which is what the kcat
+    # service below does.
+    command:
+      - mnemos-kafka
+      - --bind
+      - 0.0.0.0
+      - --advertised
+      - localhost
+      - --redis-host
+      - mnemos
+      - --partitions
+      - "3"
+    ports: ["127.0.0.1:9092:9092"]
+    depends_on:
+      mnemos:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9092"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-cli:
+    image: redis:8-alpine
+    profiles: [demo]
+    network_mode: service:mnemos
+    entrypoint: ["redis-cli", "-p", "6380"]
+
+  kcat:
+    image: edenhill/kcat:1.7.1
+    profiles: [demo]
+    network_mode: service:kafka
+    entrypoint: ["kcat", "-b", "localhost:9092"]
+
+# The volume keeps dump.rdb across restarts. mnemos has no save points, so a
+# snapshot is taken only by SAVE, BGSAVE or SHUTDOWN SAVE -- stopping the
+# container does not write one.
+volumes:
+  mnemos-data:

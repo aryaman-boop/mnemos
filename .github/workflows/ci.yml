@@ -57,6 +57,40 @@ jobs:
       - name: Kafka tests
         run: python3 ./scripts/kafka_test.py
 
+  # The image, built and driven by clients from their own images. kcat is
+  # librdkafka, so this is also the one Kafka client in CI that was not
+  # written in this repo -- pinned by image tag, so it cannot drift.
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build and start
+        run: docker compose up -d --build --wait
+
+      - name: redis-cli against the container
+        run: |
+          test "$(docker compose run --rm -T redis-cli PING)" = PONG
+          docker compose run --rm -T redis-cli SET greeting hello
+          test "$(docker compose run --rm -T redis-cli GET greeting)" = hello
+
+      - name: kcat produce and consume
+        run: |
+          echo "hello from kcat" | docker compose run --rm -T kcat -P -t smoke -p 0
+          test "$(docker compose run --rm -T kcat -C -t smoke -p 0 -o beginning -e -q)" = "hello from kcat"
+
+      - name: Persistence across a restart
+        run: |
+          docker compose run --rm -T redis-cli SAVE
+          docker compose restart mnemos
+          docker compose up -d --wait
+          test "$(docker compose run --rm -T redis-cli GET greeting)" = hello
+
+      - name: Logs
+        if: failure()
+        run: docker compose logs
+
   sanitizers:
     name: asan+ubsan
     runs-on: ubuntu-latest
