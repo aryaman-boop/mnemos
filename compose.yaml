@@ -12,14 +12,11 @@
 
 name: mnemos
 
-x-mnemos: &mnemos
-  build: .
-  image: mnemos:local
-  restart: unless-stopped
-
 services:
   mnemos:
-    <<: *mnemos
+    build: .
+    image: mnemos:local
+    restart: unless-stopped
     command: ["mnemos-server", "--bind", "0.0.0.0", "--dir", "/data"]
     # Host loopback only. mnemos has no password unless --requirepass is
     # passed, so the port is not offered to the rest of the network.
@@ -27,20 +24,27 @@ services:
     volumes: ["mnemos-data:/data"]
 
   kafka:
-    <<: *mnemos
+    # The image the mnemos service builds. Building it here as well tags
+    # mnemos:local twice, and whichever service lost that race is recreated
+    # the next time anything depends on it.
+    image: mnemos:local
+    pull_policy: never
+    restart: unless-stopped
     # mnemos-kafka installs no SIGTERM handler, and PID 1 gets no default
     # action, so without an init `docker compose stop` waits out its timeout.
     init: true
-    # Advertising localhost is right for clients on the host, through the
+    # Advertising 127.0.0.1 is right for clients on the host, through the
     # published port. A client inside this network has to share the broker's
     # network namespace for it to be right there too, which is what the kcat
-    # service below does.
+    # service below does. Not "localhost": musl resolves that to ::1 first,
+    # the broker listens on IPv4 only, and librdkafka treats the refused
+    # connection as every broker being down.
     command:
       - mnemos-kafka
       - --bind
       - 0.0.0.0
       - --advertised
-      - localhost
+      - 127.0.0.1
       - --redis-host
       - mnemos
       - --partitions
@@ -65,7 +69,7 @@ services:
     image: edenhill/kcat:1.7.1
     profiles: [demo]
     network_mode: service:kafka
-    entrypoint: ["kcat", "-b", "localhost:9092"]
+    entrypoint: ["kcat", "-b", "127.0.0.1:9092"]
 
 # The volume keeps dump.rdb across restarts. mnemos has no save points, so a
 # snapshot is taken only by SAVE, BGSAVE or SHUTDOWN SAVE -- stopping the
