@@ -2,5 +2,4 @@
 # build trees, git history and anything untracked never reach the daemon.
 *
 !CMakeLists.txt
-!include/
 !src/

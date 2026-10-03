@@ -11,7 +11,6 @@ RUN apt-get update \
 
 WORKDIR /src
 COPY CMakeLists.txt ./
-COPY include include
 COPY src src
 
 # RelWithDebInfo, not Release: it is the optimisation level CI tests and the
